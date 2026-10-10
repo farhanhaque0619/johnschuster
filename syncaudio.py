@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
+import re
 import select
 import shutil
 import signal
@@ -33,12 +35,11 @@ import numpy as np
 
 PORT = 47800                # TCP carries audio, UDP (same number) clock sync + discovery
 MAGIC = "syncaudio/1"
-DEFAULT_DELAY_MS = 120      # capture -> speaker; must cover Wi-Fi hiccups + output latency
 BLOCK_MS = 5                # capture block size
 OUTPUT_LATENCY = 0.04       # requested CoreAudio output buffer; compensated, so it only costs headroom
 
 # --------------------------------------------------------------------- wire
-HELLO, HEADER, AUDIO, STATS = b"H", b"C", b"A", b"S"
+HELLO, HEADER, AUDIO, STATS, UPDATE = b"H", b"C", b"A", b"S", b"U"
 FRAME = struct.Struct("<cI")        # kind, payload length
 AUDIO_HDR = struct.Struct("<qd")    # index of first sample, play_at (host clock)
 PING = struct.Struct("<cId")        # b"P", seq, t1
@@ -318,6 +319,14 @@ class ClickSource:
 
 
 # ------------------------------------------------------------- audio devices
+class SetupError(Exception):
+    """A problem the person can fix; `code` tells the app which help to show."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def import_sounddevice():
     try:
         import sounddevice
@@ -337,7 +346,10 @@ def find_device(sd, query: str, kind: str) -> int:
         if hits:
             return hits[0]
     names = ", ".join(f'"{devices[i]["name"]}"' for i in usable)
-    raise SystemExit(f'No {kind} device matching "{query}". Available: {names}')
+    if kind == "input" and q == "blackhole":
+        raise SetupError("no_blackhole", "BlackHole isn't installed yet. It's the free audio driver that "
+                         "lets SyncAudio hear what this Mac plays.")
+    raise SetupError("no_device", f'No {kind} device matching "{query}". Available: {names}')
 
 
 def pick_output(sd, query: str | None) -> int:
@@ -354,7 +366,7 @@ def pick_output(sd, query: str | None) -> int:
     speakers = [i for i in outputs if "speaker" in devices[i]["name"].lower()]
     if speakers or outputs:
         return (speakers or outputs)[0]
-    raise SystemExit("No speakers found.")
+    raise SetupError("no_device", "No speakers found.")
 
 
 class SoundDeviceOutput:
@@ -422,6 +434,7 @@ class _Peer:
         self.sock, self.name, self.ip = sock, name, ip
         self.q: queue.Queue = queue.Queue(maxsize=self.QUEUE)
         self.stats: dict = {}
+        self.joined = time.monotonic()
         self.alive = True
 
     def push(self, data: bytes):
@@ -441,22 +454,37 @@ class Host:
         self.peers: set = set()
         self.lock = threading.Lock()
         self.peak = 0.0
+        self.last_sound = None
         self.running = False
 
     def start(self):
         self.tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.tcp.bind(("", self.port))
-        self.tcp.listen()
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.udp.bind(("", self.port))
+        try:
+            self.tcp.bind(("", self.port))
+            self.tcp.listen()
+            self.udp.bind(("", self.port))
+        except OSError:
+            self.tcp.close()
+            self.udp.close()
+            raise
+        # Blocking calls don't notice a socket being closed under them, so the
+        # loops wake up regularly to check whether they should stop.
+        self.tcp.settimeout(0.5)
+        self.udp.settimeout(0.5)
         self.running = True
-        threading.Thread(target=self._accept_loop, daemon=True).start()
-        threading.Thread(target=self._udp_loop, daemon=True).start()
+        self._threads = [threading.Thread(target=self._accept_loop, daemon=True),
+                         threading.Thread(target=self._udp_loop, daemon=True)]
+        for t in self._threads:
+            t.start()
 
     def stop(self):
+        """Stop serving; the port is free again once this returns."""
         self.running = False
+        for t in getattr(self, "_threads", []):
+            t.join(timeout=2)
         for s in (self.tcp, self.udp):
             try:
                 s.close()
@@ -466,11 +494,23 @@ class Host:
             for p in self.peers:
                 p.alive = False
 
+    def set_delay(self, delay: float):
+        """Change the capture-to-speaker delay for everyone, live."""
+        self.delay = delay
+        data = frame(UPDATE, json.dumps({"delay": delay}).encode())
+        with self.lock:
+            peers = list(self.peers)
+        for p in peers:
+            p.push(data)
+
     def on_block(self, pcm: np.ndarray, captured_at: float):
         """Called by the capture device for every block (audio thread)."""
         n, t = self.timeline.stamp(len(pcm), captured_at)
         play_at = t + self.delay
-        self.peak = max(self.peak, float(np.abs(pcm).max(initial=0.0)))
+        peak = float(np.abs(pcm).max(initial=0.0))
+        self.peak = max(self.peak, peak)
+        if peak > 1e-4:
+            self.last_sound = time.monotonic()
         if self.local:
             self.local.feed(n, play_at, pcm)
         with self.lock:
@@ -480,6 +520,18 @@ class Host:
             data = frame(AUDIO, AUDIO_HDR.pack(n, play_at) + pcm16)
             for p in peers:
                 p.push(data)
+
+    def take_level(self) -> float:
+        """Loudest sample since the last call (0..1)."""
+        level, self.peak = self.peak, 0.0
+        return level
+
+    def listeners(self) -> list:
+        with self.lock:
+            peers = sorted(self.peers, key=lambda p: p.name.lower())
+        return [{"state": "waiting", **p.stats, "name": p.name, "ip": p.ip,
+                 "connected_s": time.monotonic() - p.joined}
+                for p in peers]
 
     def _udp_loop(self):
         while self.running:
@@ -499,6 +551,8 @@ class Host:
         while self.running:
             try:
                 sock, addr = self.tcp.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 return
             threading.Thread(target=self._serve, args=(sock, addr[0]), daemon=True).start()
@@ -551,54 +605,113 @@ class Host:
         except (OSError, ValueError, ConnectionError):
             peer.alive = False
 
-    def status(self) -> str:
-        level, self.peak = self.peak, 0.0
-        bars = int(min(1.0, level) * 8 + 0.999)
-        parts = [f"in {'▮' * bars}{'▯' * (8 - bars)}"]
-        if self.local:
-            parts.append(f"this Mac {sync_word(self.local)}")
-        with self.lock:
-            peers = sorted(self.peers, key=lambda p: p.name)
-        for p in peers:
-            st = p.stats
-            if st.get("synced"):
-                parts.append(f"{p.name} in sync ({st.get('wifi_ms') or 0:.0f} ms wifi, {st.get('dropouts') or 0} dropouts)")
-            else:
-                parts.append(f"{p.name} syncing")
-        if not peers:
-            parts.append("waiting for friends")
-        return " · ".join(parts)
+
+class AutoDelay:
+    """Picks the host's delay: as short as possible, but long enough that
+    every listener gets each block before it is due. Raises at once when a
+    listener runs short; lowers only after a long calm stretch."""
+
+    START, MIN, MAX = 0.15, 0.08, 1.5
+    MARGIN = 0.03       # headroom every listener should keep
+    SETTLE = 5.0        # seconds listeners need to measure a change
+    CALM = 120.0        # seconds of plenty of headroom before lowering
+    NO_LOWER = 600.0    # after a raise, don't lower for this long
+
+    def __init__(self, delay: float = START):
+        self.delay = delay
+        self.changed_at = self.raised_at = -math.inf
+        self.calm_since = None
+        self.drops: dict = {}
+
+    def update(self, now: float, listeners: dict):
+        """listeners: {key: stats from Client.stats()}. Returns a new delay or None."""
+        reports = {k: s for k, s in listeners.items() if s.get("headroom_ms") is not None}
+        dropped = any(s.get("dropouts", 0) > self.drops.get(k, s.get("dropouts", 0))
+                      for k, s in reports.items())
+        self.drops = {k: s.get("dropouts", 0) for k, s in reports.items()}
+        if not reports or now - self.changed_at < self.SETTLE:
+            return None
+        worst = min(s["headroom_ms"] for s in reports.values()) / 1000
+        if dropped or worst < self.MARGIN / 2:
+            new = self.delay + max(0.05, self.MARGIN - worst)
+            self.raised_at = now
+        elif worst > 4 * self.MARGIN and now - self.raised_at > self.NO_LOWER:
+            if self.calm_since is None:
+                self.calm_since = now
+            if now - self.calm_since < self.CALM:
+                return None
+            new = self.delay - min(0.05, worst - 2 * self.MARGIN)
+        else:
+            self.calm_since = None
+            return None
+        new = min(self.MAX, max(self.MIN, math.ceil(new * 100 - 1e-9) / 100))
+        if abs(new - self.delay) < 0.005:
+            return None
+        self.delay, self.changed_at, self.calm_since = new, now, None
+        return new
 
 
 # ------------------------------------------------------------------- client
-def discover(port: int = PORT, timeout: float = 1.5, address: str = "255.255.255.255"):
-    """Find a host on the local network. Returns (ip, name) or None."""
+def broadcast_targets() -> set:
+    """Where to send discovery: broadcast addresses, plus every address on
+    this Mac's /24 subnet for routers that swallow broadcasts."""
+    targets = {"255.255.255.255"}
+    try:
+        out = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=2).stdout
+        targets.update(re.findall(r"broadcast (\d+\.\d+\.\d+\.\d+)", out))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    ip = lan_ip()
+    if not ip.startswith("127."):
+        prefix = ip.rsplit(".", 1)[0]
+        targets.update(f"{prefix}.{i}" for i in range(1, 255))
+        targets.discard(ip)
+    return targets
+
+
+def discover_all(port: int = PORT, timeout: float = 1.0, targets=None) -> list:
+    """Every host answering on the local network, as [(ip, name)]."""
+    found = {}
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        try:
-            s.sendto(DISCOVER, (address, port))
-        except OSError:
-            time.sleep(timeout)
-            return None
+        for target in (broadcast_targets() if targets is None else targets):
+            try:
+                s.sendto(DISCOVER, (target, port))
+            except OSError:
+                pass
         end = time.monotonic() + timeout
         while (left := end - time.monotonic()) > 0:
             s.settimeout(left)
             try:
                 data, addr = s.recvfrom(512)
             except OSError:
-                return None
+                break
             if data[:1] == b"d":
                 try:
-                    return addr[0], json.loads(data[1:]).get("name", addr[0])
+                    found[addr[0]] = str(json.loads(data[1:]).get("name", addr[0]))
                 except ValueError:
                     pass
-    return None
+    return sorted(found.items(), key=lambda item: item[1].lower())
+
+
+def discover(port: int = PORT, timeout: float = 1.5, address: str | None = None):
+    """The first host found, as (ip, name), or None."""
+    hosts = discover_all(port, timeout, [address] if address else None)
+    return hosts[0] if hosts else None
+
+
+def player_state(p: Player | None) -> str:
+    if p is None or p.read_n is None:
+        return "waiting"
+    if p.starving:
+        return "no_audio"
+    return "in_sync" if p.in_sync else "syncing"
 
 
 class Client:
     def __init__(self, host: str | None, open_output, port: int = PORT, name: str = "friend",
                  settings: Settings | None = None, log=print, now=time.monotonic,
-                 discover_address: str = "255.255.255.255"):
+                 discover_address: str | None = None):
         self.host, self.open_output, self.port, self.name = host, open_output, port, name
         self.settings = settings or Settings()
         self.log, self.now, self.discover_address = log, now, discover_address
@@ -606,9 +719,16 @@ class Client:
         self.player: Player | None = None
         self.output = None
         self.host_name = None
-        self.state = "looking for the host"
+        self.delay = None
+        self.phase = "searching"        # searching | connecting | connected | retrying
+        self.error = None
         self.leads: deque = deque(maxlen=400)
         self.running = False
+
+    @property
+    def state(self) -> str:
+        return {"searching": "looking for the host", "connecting": "connecting",
+                "connected": "playing", "retrying": f"can't reach {self.host}:{self.port}, retrying"}[self.phase]
 
     def to_server(self, t: float):
         return self.clock.to_server(t)
@@ -626,21 +746,23 @@ class Client:
         while self.running:
             ip = self.host
             if not ip:
-                self.state = "looking for the host"
+                self.phase = "searching"
                 found = discover(self.port, address=self.discover_address)
                 if not found:
                     continue
                 ip, self.host_name = found
             try:
+                self.phase = "connecting"
                 self._session(ip)
             except (OSError, ValueError, KeyError, ConnectionError) as e:
-                if self.running and self.state == "playing":
+                if self.running and self.phase == "connected":
                     self.log(f"lost the host ({e}); reconnecting...")
             except Exception as e:  # e.g. the speaker can't be opened
+                self.error = str(e)
                 self.log(f"error: {e!r}")
                 time.sleep(2)
             if self.running:
-                self.state = f"can't reach {ip}:{self.port}, retrying" if self.host else "looking for the host"
+                self.phase = "retrying" if self.host else "searching"
                 time.sleep(1)
 
     def _session(self, ip: str):
@@ -655,17 +777,20 @@ class Client:
             hdr = json.loads(payload)
             rate, channels = int(hdr["rate"]), int(hdr["channels"])
             self.host_name = hdr.get("name", ip)
+            self.delay = float(hdr.get("delay", 0))
             self.clock = ClockSync()
             self.leads.clear()
             if self.player is None or (self.player.rate, self.player.channels) != (rate, channels):
                 if self.output:
                     self.output.close()
+                    self.output = None
                 self.player = Player(rate, channels, self.to_server, self.settings)
                 self.output = self.open_output(rate, self.player.render)
             else:
                 self.player.reset()
+            self.error = None
             threading.Thread(target=self._ping_loop, args=(ip, stop), daemon=True).start()
-            self.state = "playing"
+            self.phase = "connected"
             self.log(f"connected to {self.host_name} ({ip})")
             last_stats = self.now()
             while self.running:
@@ -677,6 +802,8 @@ class Client:
                     server_now = self.clock.to_server(self.now())
                     if server_now is not None:
                         self.leads.append(play_at - server_now)
+                elif kind == UPDATE:
+                    self.delay = float(json.loads(payload).get("delay", self.delay))
                 if self.now() - last_stats >= 1.0:
                     last_stats = self.now()
                     sock.sendall(frame(STATS, json.dumps(self.stats()).encode()))
@@ -713,15 +840,18 @@ class Client:
 
     def stats(self) -> dict:
         p = self.player
+        room = self.headroom()
         return {
+            "state": player_state(p),
             "synced": bool(p and p.in_sync),
             "err_ms": round(p.err * 1000, 2) if p else None,
             "wifi_ms": round(self.clock.rtt * 1000, 1) if self.clock.rtt is not None else None,
+            "headroom_ms": round(room * 1000) if room is not None else None,
             "dropouts": p.dropouts if p else 0,
         }
 
     def status(self) -> str:
-        if self.state != "playing" or not self.player:
+        if self.phase != "connected" or not self.player:
             return self.state
         p, parts = self.player, [f"{self.host_name}"]
         if self.clock.estimate is None:
@@ -731,8 +861,213 @@ class Client:
             parts.append(f"wifi {self.clock.rtt * 1000:.1f} ms")
         room = self.headroom()
         if room is not None:
-            parts.append(f"headroom {room * 1000:.0f} ms" + (" ⚠ raise --delay on the host" if room < 0.01 else ""))
+            parts.append(f"headroom {room * 1000:.0f} ms" + (" ⚠ audio arriving late" if room < 0.01 else ""))
         return " · ".join(parts)
+
+
+# ----------------------------------------------------------------- sessions
+class SystemOutput:
+    """Points the Mac's sound output at BlackHole while hosting, and back after."""
+
+    def __init__(self, log, tool: str | None = None):
+        self.tool = tool or shutil.which("SwitchAudioSource")
+        self.log = log
+        self.previous = None
+
+    def _run(self, *args) -> str:
+        try:
+            return subprocess.run([self.tool, *args, "-t", "output"], capture_output=True,
+                                  text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            self.log(f"! couldn't change the sound output: {e}")
+            return ""
+
+    def current(self) -> str:
+        return self._run("-c") if self.tool else ""
+
+    def switch_to(self, name: str, fallback: str | None):
+        if not self.tool:
+            self.log(f'! Set this Mac\'s sound output to "{name}" (Control Center → Sound) '
+                     "so apps play into SyncAudio.")
+            return
+        current = self.current()
+        self.previous = fallback if "blackhole" in current.lower() else current
+        if current != name:
+            self._run("-s", name)
+            self.log(f'Sound output switched to "{name}" (restored when you stop).')
+
+    def set(self, name: str):
+        if self.tool and name:
+            self._run("-s", name)
+
+    def restore(self):
+        if self.tool and self.previous:
+            self._run("-s", self.previous)
+            self.previous = None
+
+
+def player_info(p: Player | None) -> dict:
+    return {"state": player_state(p), "err_ms": round(p.err * 1000, 2) if p else None,
+            "dropouts": p.dropouts if p else 0}
+
+
+class HostSession:
+    """Everything hosting needs: capture, playback on this Mac, the network
+    side, switching the sound output to BlackHole, and the automatic delay."""
+
+    def __init__(self, sd, name: str, delay_ms: float | None = None, click: bool = False,
+                 play_local: bool = True, input_query: str = "BlackHole", output_query: str | None = None,
+                 settings: Settings | None = None, port: int = PORT, switch_output: bool = True,
+                 switch_tool: str | None = None, log=print):
+        self.sd, self.name, self.click, self.play_local = sd, name, click, play_local
+        self.input_query, self.output_query, self.port = input_query, output_query, port
+        self.settings = settings or Settings()
+        self.switch_output, self.switch_tool, self.log = switch_output, switch_tool, log
+        self.auto = AutoDelay() if delay_ms is None else None
+        self.fixed_delay = None if delay_ms is None else delay_ms / 1000
+        self.host = self.output = self.source = self.system = None
+        self._stop = threading.Event()
+
+    @property
+    def delay(self) -> float:
+        return self.host.delay if self.host else (self.auto.delay if self.auto else self.fixed_delay)
+
+    def start(self):
+        sd = self.sd
+        out_dev = pick_output(sd, self.output_query) if self.play_local else None
+        if self.click:
+            rate, channels, in_dev = 48000, 2, None
+        else:
+            in_dev = find_device(sd, self.input_query, "input")
+            info = sd.query_devices(in_dev, "input")
+            rate, channels = int(info["default_samplerate"]), min(2, info["max_input_channels"])
+        self.host = Host(rate, channels, self.delay, self.port, self.name, log=self.log)
+        try:
+            self.host.start()
+        except OSError as e:
+            self.host = None
+            raise SetupError("port_busy", f"Can't share on port {self.port} ({e}). "
+                                          "Is SyncAudio already sharing on this Mac?")
+        try:
+            if out_dev is not None:
+                self.host.local = Player(rate, channels, lambda t: t, self.settings)
+                self.output = SoundDeviceOutput(sd, out_dev, rate, self.host.local.render)
+            if self.click:
+                self.source = ClickSource(rate, channels, self.host.on_block)
+            else:
+                self.source = SoundDeviceInput(sd, in_dev, rate, channels, self.host.on_block)
+                if self.switch_output:
+                    self.system = SystemOutput(self.log, self.switch_tool)
+                    self.system.switch_to(self.source.name, self.output.name if self.output else None)
+            self.source.start()
+        except sd.PortAudioError as e:
+            self.stop()
+            raise SetupError("audio", f"Couldn't open the audio device ({e}).")
+        except BaseException:
+            self.stop()
+            raise
+        self.started = time.monotonic()
+        threading.Thread(target=self._tick_loop, daemon=True).start()
+        return self
+
+    def _tick_loop(self):
+        while not self._stop.wait(1.0):
+            if self.auto and self.host:
+                now = time.monotonic()
+                ready = {l["ip"] + l["name"]: l for l in self.host.listeners() if l["connected_s"] > 5}
+                new = self.auto.update(now, ready)
+                if new is not None:
+                    self.host.set_delay(new)
+                    self.log(f"delay set to {new * 1000:.0f} ms to keep everyone fed")
+
+    def set_delay(self, delay_ms: float | None):
+        """None = automatic."""
+        if delay_ms is None:
+            self.auto = self.auto or AutoDelay(self.delay)
+        else:
+            self.auto = None
+            self.fixed_delay = min(AutoDelay.MAX, max(0.04, delay_ms / 1000))
+            if self.host:
+                self.host.set_delay(self.fixed_delay)
+
+    def stop(self):
+        self._stop.set()
+        if self.system:
+            self.system.restore()
+        for thing in (self.source, self.output):
+            if thing:
+                try:
+                    thing.close()
+                except Exception:
+                    pass
+        if self.host:
+            self.host.stop()
+
+    def silent_for(self) -> float:
+        last = self.host.last_sound if self.host else None
+        return time.monotonic() - max(last or 0.0, getattr(self, "started", time.monotonic()))
+
+    def info(self) -> dict:
+        h = self.host
+        return {
+            "mode": "hosting", "name": self.name, "address": lan_ip(), "port": self.port,
+            "click": self.click, "capture": self.source.name if isinstance(self.source, SoundDeviceInput) else None,
+            "output": self.output.name if self.output else None,
+            "level": round(h.take_level(), 3), "silent_s": round(self.silent_for(), 1),
+            "delay_ms": round(h.delay * 1000), "auto_delay": self.auto is not None,
+            "local": player_info(h.local) if h.local else None,
+            "listeners": h.listeners(),
+        }
+
+    def status_line(self) -> str:
+        h = self.host
+        bars = int(min(1.0, h.take_level()) * 8 + 0.999)
+        parts = [f"in {'▮' * bars}{'▯' * (8 - bars)}"]
+        if h.local:
+            parts.append(f"this Mac {sync_word(h.local)}")
+        for l in h.listeners():
+            if l.get("synced"):
+                parts.append(f"{l['name']} in sync ({l.get('wifi_ms') or 0:.0f} ms wifi, "
+                             f"{l.get('dropouts') or 0} dropouts)")
+            else:
+                parts.append(f"{l['name']} syncing")
+        if not h.listeners():
+            parts.append("waiting for friends")
+        parts.append(f"delay {h.delay * 1000:.0f} ms" + (" (auto)" if self.auto else ""))
+        return " · ".join(parts)
+
+
+class JoinSession:
+    """Listening: play a host's stream on this Mac."""
+
+    def __init__(self, sd, address: str | None, name: str, output_query: str | None = None,
+                 settings: Settings | None = None, port: int = PORT, log=print):
+        self.sd, self.address, self.name, self.output_query = sd, address, name, output_query
+        self.settings = settings or Settings()
+        self.port, self.log = port, log
+        self.client = None
+
+    def start(self):
+        sd = self.sd
+        out_dev = pick_output(sd, self.output_query)
+        self.output_name = sd.query_devices(out_dev)["name"]
+        self.client = Client(self.address, lambda rate, render: SoundDeviceOutput(sd, out_dev, rate, render),
+                             self.port, self.name, self.settings, log=self.log)
+        self.client.start()
+        return self
+
+    def stop(self):
+        if self.client:
+            self.client.stop()
+
+    def info(self) -> dict:
+        c = self.client
+        return {
+            "mode": "listening", "address": self.address, "host_name": c.host_name,
+            "connection": c.phase, "output": self.output_name, "error": c.error,
+            "delay_ms": round(c.delay * 1000) if c.delay is not None else None,
+            "clock": c.clock.estimate is not None, **c.stats(),
+        }
 
 
 # ----------------------------------------------------------------- terminal
@@ -842,114 +1177,46 @@ def lan_ip() -> str:
         return "127.0.0.1"
 
 
-class SystemOutput:
-    """Points the Mac's sound output at BlackHole while hosting, and back after."""
-
-    def __init__(self, log):
-        self.tool = shutil.which("SwitchAudioSource")
-        self.log = log
-        self.previous = None
-
-    def _run(self, *args) -> str:
-        try:
-            return subprocess.run([self.tool, *args, "-t", "output"], capture_output=True,
-                                  text=True, timeout=5).stdout.strip()
-        except (OSError, subprocess.SubprocessError) as e:
-            self.log(f"! couldn't change the sound output: {e}")
-            return ""
-
-    def switch_to(self, name: str, fallback: str | None):
-        if not self.tool:
-            self.log(f'! Set your Mac\'s sound output to "{name}" (Control Center → Sound) '
-                     "so apps play into syncaudio. (brew install switchaudio-osx does this for you.)")
-            return
-        current = self._run("-c")
-        self.previous = fallback if "blackhole" in current.lower() else current
-        if current != name:
-            self._run("-s", name)
-            self.log(f'Sound output switched to "{name}" (restored when you quit).')
-
-    def restore(self):
-        if self.tool and self.previous:
-            self._run("-s", self.previous)
-            self.previous = None
-
-
 def run_host(args):
     sd = import_sounddevice()
-    con_settings = Settings(args.offset, channel=args.channel)
-    with Console(None if args.no_local else con_settings) as con:
-        name = args.name or computer_name()
-        out_dev = None if args.no_local else pick_output(sd, args.output)
-        if args.click:
-            rate, channels, in_dev = 48000, 2, None
-        else:
-            in_dev = find_device(sd, args.input, "input")
-            info = sd.query_devices(in_dev, "input")
-            rate, channels = int(info["default_samplerate"]), min(2, info["max_input_channels"])
-
-        host = Host(rate, channels, args.delay / 1000, args.port, name, log=con.log)
+    settings = Settings(args.offset, channel=args.channel)
+    with Console(None if args.no_local else settings) as con:
+        session = HostSession(sd, args.name or computer_name(), args.delay, args.click, not args.no_local,
+                              args.input, args.output, settings, args.port, not args.no_switch, log=con.log)
+        session.start()
         try:
-            host.start()
-        except OSError as e:
-            sys.exit(f"Can't listen on port {args.port} ({e}). Is syncaudio already running?")
-
-        output = system = source = None
-        try:
-            if out_dev is not None:
-                host.local = Player(rate, channels, lambda t: t, con_settings)
-                output = SoundDeviceOutput(sd, out_dev, rate, host.local.render)
-            if args.click:
-                source = ClickSource(rate, channels, host.on_block)
-            else:
-                source = SoundDeviceInput(sd, in_dev, rate, channels, host.on_block)
-                if not args.no_switch:
-                    system = SystemOutput(con.log)
-                    system.switch_to(source.name, output.name if output else None)
-            source.start()
-
             ip = lan_ip()
-            con.log(f'Hosting as "{name}" at {ip}  ({rate} Hz, {args.delay:.0f} ms delay)')
-            con.log("  capturing: " + ("metronome test signal" if args.click else source.name))
-            con.log("  playing on: " + (output.name if output else "nothing (--no-local)"))
-            con.log(f"  friend runs: ./syncaudio join      (or ./syncaudio join {ip})")
+            delay = "automatic delay" if args.delay is None else f"{args.delay:.0f} ms delay"
+            con.log(f'Hosting as "{session.name}" at {ip}  ({session.host.rate} Hz, {delay})')
+            con.log("  capturing: " + ("metronome test signal" if args.click else session.source.name))
+            con.log("  playing on: " + (session.output.name if session.output else "nothing (--no-local)"))
+            con.log(f"  friends run: ./syncaudio join      (or ./syncaudio join {ip})")
             if con.tty:
                 con.log("  " + con.HELP)
-            started = time.monotonic()
             while not con.quit.wait(0.25):
-                text = host.status()
-                if not args.click and time.monotonic() - started > 15 and host.timeline.n and \
-                        "▮" not in text:
+                text = session.status_line()
+                if not args.click and session.silent_for() > 15:
                     text += " · silent: play something (or allow Terminal in Privacy → Microphone)"
                 con.status(text)
-        except sd.PortAudioError as e:
-            sys.exit(f"Audio device error: {e}")
         finally:
-            if system:
-                system.restore()
-            for thing in (source, output):
-                if thing:
-                    thing.close()
-            host.stop()
+            session.stop()
 
 
 def run_client(args):
     sd = import_sounddevice()
     settings = Settings(args.offset, channel=args.channel)
     with Console(settings) as con:
-        out_dev = pick_output(sd, args.output)
-        client = Client(args.host, lambda rate, render: SoundDeviceOutput(sd, out_dev, rate, render),
-                        args.port, args.name or computer_name(), settings, log=con.log)
-        con.log(f"Playing on: {sd.query_devices(out_dev)['name']}")
+        session = JoinSession(sd, args.host, args.name or computer_name(), args.output, settings,
+                              args.port, log=con.log).start()
+        con.log(f"Playing on: {session.output_name}")
         con.log(f"Looking for the host at {args.host}..." if args.host else "Looking for the host on this network...")
         if con.tty:
             con.log("  " + con.HELP)
-        client.start()
         try:
             while not con.quit.wait(0.25):
-                con.status(client.status())
+                con.status(session.client.status())
         finally:
-            client.stop()
+            session.stop()
 
 
 def run_devices(_args):
@@ -972,9 +1239,8 @@ def main(argv=None):
 
     h = sub.add_parser("host", help="share this Mac's audio")
     common(h)
-    h.add_argument("--delay", type=float, default=DEFAULT_DELAY_MS, metavar="MS",
-                   help=f"capture-to-speaker delay (default {DEFAULT_DELAY_MS}); "
-                        "lower = snappier, higher = survives worse Wi-Fi")
+    h.add_argument("--delay", type=float, default=None, metavar="MS",
+                   help="fixed capture-to-speaker delay; default: automatic (as low as the Wi-Fi allows)")
     h.add_argument("--input", default="BlackHole", help="device to capture (default: BlackHole)")
     h.add_argument("--click", action="store_true", help="stream a metronome to check the sync by ear")
     h.add_argument("--no-local", action="store_true", help="don't play on this Mac")
@@ -997,6 +1263,8 @@ def main(argv=None):
         args.func(args)
     except KeyboardInterrupt:
         pass
+    except SetupError as e:
+        sys.exit(str(e) + (" Run ./setup.sh host to install it." if e.code == "no_blackhole" else ""))
 
 
 if __name__ == "__main__":

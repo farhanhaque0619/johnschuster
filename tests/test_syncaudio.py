@@ -279,14 +279,14 @@ class EndToEndTest(unittest.TestCase):
         client.start()
         try:
             time.sleep(10)
-            status = host.status()
+            listeners = host.listeners()
         finally:
             clicks.close()
             client.stop()
             host_speaker.close()
             host.stop()
 
-        self.assertIn("test-friend in sync", status)
+        self.assertEqual([(l["name"], l["state"]) for l in listeners], [("test-friend", "in_sync")])
         self.assertEqual(client.state, "playing")
         h, f = host_speaker.onsets(), speakers[0].onsets()
         cutoff = host.timeline.t0 + 5        # give clock sync a few seconds
@@ -401,7 +401,7 @@ class CommandLineTest(unittest.TestCase):
                 sa.main(["join", "127.0.0.1", "--port", str(port), "--name", "Sam"])
             host.join(10)
         log = out.getvalue()
-        self.assertIn('Set your Mac\'s sound output to "BlackHole 2ch"', log)
+        self.assertIn('Set this Mac\'s sound output to "BlackHole 2ch"', log)
         self.assertIn("playing on: MacBook Pro Speakers", log)    # not BlackHole: no feedback loop
         self.assertIn("+ Sam joined", log)
         self.assertIn("connected to Den", log)
@@ -409,6 +409,108 @@ class CommandLineTest(unittest.TestCase):
         for sd in (hosting, joining):
             played = np.concatenate(sd.outputs[0].written[-50:])
             self.assertGreater(np.abs(played).max(), 0.4, "the 440 Hz tone reached the speaker")
+
+
+class AutoDelayTest(unittest.TestCase):
+    def test_raises_at_once_when_a_listener_runs_short(self):
+        auto = sa.AutoDelay()
+        self.assertIsNone(auto.update(10, {"a": {"headroom_ms": 60, "dropouts": 0}}))
+        new = auto.update(11, {"a": {"headroom_ms": -219, "dropouts": 3}, "b": {"headroom_ms": 80, "dropouts": 0}})
+        self.assertAlmostEqual(new, 0.40)      # 150 ms + 219 ms late + 30 ms margin, rounded up
+        # Listeners need a few seconds to measure the new delay; old bad numbers are ignored.
+        self.assertIsNone(auto.update(13, {"a": {"headroom_ms": -219, "dropouts": 5}}))
+
+    def test_dropouts_alone_raise_the_delay(self):
+        auto = sa.AutoDelay()
+        auto.update(0, {"a": {"headroom_ms": 40, "dropouts": 0}})
+        self.assertAlmostEqual(auto.update(1, {"a": {"headroom_ms": 40, "dropouts": 1}}), 0.20)
+
+    def test_lowers_slowly_after_a_long_calm(self):
+        auto = sa.AutoDelay(0.4)
+        changes = [(t, d) for t in range(1500)
+                   if (d := auto.update(t, {"a": {"headroom_ms": 400, "dropouts": 0}})) is not None]
+        self.assertGreaterEqual(changes[0][0], sa.AutoDelay.CALM)
+        steps = np.diff([0.4] + [d for _, d in changes])
+        self.assertTrue(np.all(steps < 0) and np.all(steps >= -0.0501), steps)
+        self.assertGreaterEqual(changes[-1][1], sa.AutoDelay.MIN)
+
+    def test_never_lowers_soon_after_trouble(self):
+        auto = sa.AutoDelay()
+        auto.update(0, {"a": {"headroom_ms": 5, "dropouts": 0}})        # raised
+        lowered = [t for t in range(1, 600) if auto.update(t, {"a": {"headroom_ms": 400, "dropouts": 0}})]
+        self.assertEqual(lowered, [])
+
+    def test_waits_for_measurements(self):
+        self.assertIsNone(sa.AutoDelay().update(10, {"a": {"headroom_ms": None, "dropouts": 0}}))
+        self.assertIsNone(sa.AutoDelay().update(10, {}))
+
+
+class SessionTest(unittest.TestCase):
+    """HostSession + JoinSession, the pieces the app is built from."""
+
+    def test_three_macs_and_a_live_delay_change(self):
+        quiet = lambda *a: None
+        port = free_port()
+        host_sd = FakeSoundDevice()
+        with mock.patch.object(sa.shutil, "which", return_value=None):
+            host = sa.HostSession(host_sd, "Den", port=port, log=quiet).start()
+        listeners = [sa.JoinSession(FakeSoundDevice(), "127.0.0.1", name, port=port, log=quiet).start()
+                     for name in ("Sam", "Alex")]
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                info = host.info()
+                if [l["state"] for l in info["listeners"]] == ["in_sync", "in_sync"]:
+                    break
+                time.sleep(0.25)
+            self.assertEqual([(l["name"], l["state"]) for l in info["listeners"]],
+                             [("Alex", "in_sync"), ("Sam", "in_sync")])
+            self.assertTrue(info["auto_delay"])
+            self.assertEqual(info["local"]["state"], "in_sync")
+            self.assertEqual(info["capture"], "BlackHole 2ch")
+            self.assertEqual(info["output"], "MacBook Pro Speakers")
+
+            host.set_delay(300)
+            time.sleep(4)
+            for l in listeners:
+                state = l.info()
+                self.assertEqual(state["delay_ms"], 300)
+                self.assertEqual(state["connection"], "connected")
+                self.assertEqual(state["state"], "in_sync")
+                self.assertGreater(state["headroom_ms"], 150)
+            self.assertEqual(host.info()["delay_ms"], 300)
+            self.assertFalse(host.info()["auto_delay"])
+        finally:
+            for l in listeners:
+                l.stop()
+            host.stop()
+        for sd in [host_sd] + [l.sd for l in listeners]:
+            played = np.concatenate(sd.outputs[-1].written[-50:])
+            self.assertGreater(np.abs(played).max(), 0.4, "the 440 Hz tone reached every speaker")
+
+    def test_missing_blackhole_is_a_setup_error(self):
+        sd = FakeSoundDevice()
+        sd.DEVICES = [d for d in sd.DEVICES if "BlackHole" not in d["name"]]
+        with self.assertRaises(sa.SetupError) as caught:
+            sa.HostSession(sd, "Den", port=free_port(), log=lambda *a: None).start()
+        self.assertEqual(caught.exception.code, "no_blackhole")
+
+    def test_sharing_can_restart_on_the_same_port(self):
+        port = free_port()
+        for _ in range(3):
+            host = sa.Host(RATE, 2, 0.1, port, "Den", log=lambda *a: None)
+            host.start()
+            host.stop()
+
+    def test_discover_all(self):
+        port = free_port()
+        host = sa.Host(RATE, 2, 0.1, port, "Kitchen", log=lambda *a: None)
+        host.start()
+        try:
+            self.assertEqual(sa.discover_all(port, 0.5, ["127.0.0.1", "127.0.0.1"]), [("127.0.0.1", "Kitchen")])
+            self.assertEqual(sa.discover_all(free_port(), 0.3, ["127.0.0.1"]), [])
+        finally:
+            host.stop()
 
 
 if __name__ == "__main__":

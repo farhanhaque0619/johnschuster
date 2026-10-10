@@ -1,145 +1,135 @@
-# syncaudio
+# SyncAudio
 
 Play whatever one Mac is playing (Spotify, YouTube, a game, anything) out of
-**two or more MacBooks' speakers at the same time, in sync**.
+**any number of Macs at the same time, in sync**. Put two MacBooks in a room
+and they sound like one bigger speaker, or like a stereo pair.
 
-```
- your Mac (host)                                   friend's Mac
- Spotify / YouTube / anything
-        │  (sound output → BlackHole)
-        ▼
- syncaudio host ───── Wi-Fi: audio + clock sync ────► syncaudio join
-        │                                                   │
-        ▼                                                   ▼
- speakers play sample n at time T  ◄──── same T ────►  speakers play sample n at time T
-```
+<p>
+  <img src="docs/sharing.png" width="300" alt="The Mac that shares: a level meter and a list of Macs that are in sync">
+  &nbsp;
+  <img src="docs/listening.png" width="300" alt="A Mac that joined: in sync, with volume and sync controls">
+</p>
 
-The host captures its system audio through BlackHole (a free virtual audio
-cable). Each block of audio is stamped with the exact moment **T** it should
-come out of the speakers. Every Mac, the host included, waits until T before
-playing it, so both speakers play the same sample together. Neither Mac runs
-ahead of the other.
+## Get it
 
-* The Macs keep their clocks matched with constant pings, trusting only the
-  fastest round trips. In simulated tests with drifting clocks and jittery
-  Wi-Fi, the two Macs stay within about **1 ms** of each other. For scale,
-  sound takes about 3 ms to cross one metre of room.
-* CoreAudio reports each speaker's own output delay, and each Mac corrects
-  for it.
-* Small clock drift is fixed by adding or skipping a single sample now and
-  then, which you can't hear. A Wi-Fi hiccup gives a moment of silence, but
-  the two Macs never drift apart.
-* Total delay from your Mac to the speakers is **120 ms** by default
-  (adjustable, see below).
+1. **Download** SyncAudio from the
+   [download page](https://github.com/farhanhaque0619/johnschuster/releases/latest):
+   * `SyncAudio-AppleSilicon.dmg` for M1, M2, M3, M4 or newer Macs
+   * `SyncAudio-Intel.dmg` for older Intel Macs
 
-## Setup (once)
+   Not sure which you have? Apple menu → **About This Mac**. "Chip: Apple M…" means Apple Silicon.
+2. Open the `.dmg` and drag **SyncAudio** onto **Applications**.
+3. Open SyncAudio from Applications.
+   * **"Apple could not verify SyncAudio…"**: click **Done**, open **System Settings →
+     Privacy & Security**, scroll down, click **Open Anyway** and confirm. You only do
+     this once. (It appears because the app isn't from the App Store.)
+4. When it asks to **find devices on your local network**, click **Allow**.
 
-You need [Homebrew](https://brew.sh) on both Macs, and both Macs on the same
-Wi-Fi (not a guest network).
+Every Mac that plays music needs SyncAudio installed, and all of them must be on
+the **same Wi-Fi**.
 
-Get this folder onto both Macs (`git clone`, or AirDrop it), then in Terminal:
+## Use it
 
-```bash
-# On YOUR Mac (the one that plays the music):
-./setup.sh host
+**On the Mac playing the music:** click **Start sharing**.
 
-# On your FRIEND's Mac:
-./setup.sh
-```
+* The first time, SyncAudio offers to install **BlackHole**, a free audio
+  driver that lets it hear what your Mac plays. Click **Install BlackHole** and
+  type your Mac password. Only the sharing Mac needs it.
+* Click **Allow** when asked about the microphone. SyncAudio listens to
+  BlackHole, never to your real microphone.
+* Play anything. The bar moves when sound is coming through.
 
-`setup.sh host` also installs **BlackHole** (it asks for your password) and
-**SwitchAudioSource**. If BlackHole doesn't show up afterwards, restart the Mac.
+**On every other Mac:** open SyncAudio. The sharing Mac appears under
+**Join a Mac that's sharing**; click **Join**. That's it. Add as many Macs as
+you like, and they all stay in sync.
 
-## Use
+**Controls (each Mac has its own):**
 
-```bash
-# Your Mac
-./syncaudio host
+| Control       | What it does                                                                 |
+|---------------|------------------------------------------------------------------------------|
+| Volume        | This Mac's volume. On the sharing Mac, the keyboard volume keys set everyone's volume. |
+| Sync nudge    | If you hear an echo or a double beat between Macs, nudge one until they sound like a single speaker. |
+| Both / Left / Right | Put two Macs apart, set one to Left and the other to Right: real stereo. |
+| Delay (sharing Mac) | **Auto** keeps it as low as the Wi-Fi allows and raises it if anyone's audio arrives late. |
+| Play test clicks | Plays a metronome to check the sync by ear: one crisp click = in sync. |
 
-# Friend's Mac (finds your Mac automatically)
-./syncaudio join
-```
+When you click **Stop**, your Mac's sound goes back to its speakers.
 
-Then play anything on your Mac. While hosting, your Mac's sound output is
-switched to BlackHole, and it switches back when you quit.
+## If something's off
 
-The first time you run it, macOS asks a couple of things. Say **Allow** to both:
-* *"Terminal would like to access the microphone"* (on the host). BlackHole
-  counts as a microphone, and without this you stream silence.
-* *"Accept incoming network connections"* for Python (on the host).
+* **The other Mac doesn't show up under Join.** Make sure both Macs are on the same
+  Wi-Fi (not a guest network). Check **System Settings → Privacy & Security → Local
+  Network** and turn on SyncAudio. You can also type the address shown on the sharing
+  Mac into the box under the list.
+* **The bar doesn't move while music plays.** Turn on SyncAudio in **System Settings →
+  Privacy & Security → Microphone**, then stop and start sharing.
+* **Audio drops out.** With delay on Auto, SyncAudio raises the delay within a few
+  seconds. If it keeps happening, move closer to the router or use 5 GHz Wi-Fi.
+  Macs also briefly pause Wi-Fi to scan for AirDrop. Running
+  `sudo ifconfig awdl0 down` in Terminal on each Mac turns that off until restart,
+  which often fixes repeated dropouts.
+* **No sound on the sharing Mac after a crash.** Open SyncAudio again and it puts the
+  sound back, or pick your speakers in **Control Center → Sound**.
 
-If auto-discovery doesn't find the host (some routers block it), use the IP
-address that `./syncaudio host` prints: `./syncaudio join 192.168.1.23`.
+## How it works
 
-### Check the sync by ear (recommended first time)
+The sharing Mac captures its audio through BlackHole and stamps every 5 ms
+block with the exact moment it should come out of the speakers. Every Mac,
+including the sharing one, holds each block until that moment. The Macs
+match clocks by pinging each other constantly and trusting only the fastest
+round trips. Each Mac also corrects for its own speaker's delay as reported
+by macOS. Clock drift is fixed by adding or skipping a single sample now and
+then, which you can't hear.
 
-```bash
-./syncaudio host --click     # host: plays a metronome instead of your Mac's audio
-./syncaudio join             # friend
-```
+In simulated tests with drifting clocks and jittery Wi-Fi, the Macs stay
+within about 1 ms of each other. For scale, sound takes about 3 ms to cross
+a metre of room.
 
-Put the Macs side by side. If they're in sync you hear **one crisp click**.
-If you hear a "flam" (a doubled *t-tick*), press `]` or `[` on the friend's
-Mac to nudge it later or earlier by 1 ms until the click is clean. You can also
-pass the value at startup next time, for example `./syncaudio join --offset 3`.
+---
 
-### Keys (in the Terminal window)
+## For developers
 
-| key       | does                                                   |
-|-----------|--------------------------------------------------------|
-| `+` / `-` | this Mac's volume                                      |
-| `]` / `[` | play this Mac 1 ms later / earlier (`}` `{` = 10 ms)   |
-| `c`       | cycle: both channels → left only → right only          |
-| `q`       | quit                                                   |
+The app is `app.py` (a small local web server plus a native window) around
+the engine in `syncaudio.py`, with the interface in `ui/index.html`.
 
-The host's normal volume keys control the shared stream, so they change the
-volume for everyone. The friend's volume keys only change their own Mac.
-
-**Stereo trick:** put the Macs a few metres apart, press `c` once on the
-host (left only) and twice on the friend's Mac (right only). Now you have real
-stereo speakers.
-
-## Tuning the delay
-
-`--delay` (host only) is the time from your Mac playing a sound to it coming
-out of the speakers.
+**Run from source** (Python 3.9+):
 
 ```bash
-./syncaudio host --delay 80     # snappier, needs good Wi-Fi
-./syncaudio host --delay 200    # rock solid on busy / weak Wi-Fi
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt pywebview
+.venv/bin/python app.py              # or: app.py --browser
 ```
 
-The friend's status line shows **headroom**, which is how early the audio
-arrives before it's needed. If headroom drops near 0 or you get dropouts,
-raise `--delay`. If headroom stays above 50 ms, you can lower it.
+**Build the .dmg:** pushing to `main` or `claude/dreamy-johnson-s8n24w` runs
+`.github/workflows/build-mac.yml`. On Apple Silicon and Intel Macs it runs the
+tests, builds `SyncAudio.app` with PyInstaller (`packaging/SyncAudio.spec`),
+self-tests it, packs the `.dmg` files, and publishes them on the
+[download page](https://github.com/farhanhaque0619/johnschuster/releases/latest).
+The app is ad-hoc signed, not notarized, which is why macOS asks you to confirm
+the first launch. With an Apple Developer account it could be signed and
+notarized so that prompt goes away.
 
-With **YouTube or other video**, the sound is now `--delay` ms behind the
-picture on your screen. 120 ms is barely noticeable. If lips look off, try
-`--delay 70` or `80`.
-
-## Troubleshooting
-
-* **Friend can't find the host:** use `./syncaudio join <ip>`. Make sure both
-  Macs are on the same network, not a guest or "isolated" Wi-Fi, which blocks
-  devices from talking to each other.
-* **Host shows "silent":** play something. If something *is* playing, allow
-  Terminal in System Settings → Privacy & Security → Microphone, then restart
-  `./syncaudio host`.
-* **Wrong speaker:** `./syncaudio devices` lists audio devices, and you pick
-  one with `--output "name"`. Built-in or wired speakers sync best.
-  Bluetooth/AirPods report their delay less precisely, so use `[` `]` to fix
-  them by ear.
-* **No sound on the host after a crash:** set the output back in Control Center
-  → Sound.
-* More than two Macs work too: run `./syncaudio join` on each.
-
-## Running the tests
+**Tests** (no audio hardware needed):
 
 ```bash
 python3 -m unittest discover tests
 ```
 
-The tests simulate two Macs whose clocks and sound cards drift apart over a
-jittery network, then run real host/friend sessions over the network with
-simulated speakers. They check that the same click comes out of both within
-2 ms. They need `numpy` but no audio hardware.
+They simulate Macs whose clocks and sound cards drift apart over jittery Wi-Fi,
+run real sessions with three Macs over the network with simulated speakers,
+and drive the app's API.
+
+### Terminal version
+
+The same engine works from the Terminal, without the app:
+
+```bash
+./setup.sh host                 # on the sharing Mac (installs BlackHole via Homebrew)
+./setup.sh                      # on the others
+./syncaudio host                # share (add --click for the metronome)
+./syncaudio join [address]      # listen; finds the host by itself
+```
+
+Keys while running: `+`/`-` volume, `[` `]` nudge 1 ms (`{` `}` 10 ms),
+`c` cycles both/left/right, `q` quits. `./syncaudio host --delay 250` fixes the
+delay instead of choosing it automatically.

@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SyncAudio</title>
+<style>
+  :root {
+    --bg: #f2f2f7; --card: #ffffff; --text: #1c1c1e; --muted: #6e6e73; --line: #e5e5ea;
+    --accent: #5e5ce6; --accent-text: #ffffff; --accent-soft: #ecebff;
+    --green: #28a745; --yellow: #e0a100; --red: #e5484d; --grey: #a1a1a6;
+    --field: #f2f2f7; --seg-on: #ffffff; --shadow: 0 1px 2px rgba(0,0,0,.04), 0 4px 16px rgba(0,0,0,.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161618; --card: #232326; --text: #f5f5f7; --muted: #98989f; --line: #34343a;
+      --accent: #7d7aff; --accent-soft: #2e2c52; --field: #2e2e33; --seg-on: #4a4a52;
+      --green: #32d158; --yellow: #ffcc00; --red: #ff6961; --grey: #636366;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+         -webkit-font-smoothing: antialiased; -webkit-user-select: none; user-select: none; }
+  input { -webkit-user-select: text; user-select: text; }
+  main { max-width: 520px; margin: 0 auto; padding: 18px 16px 28px; }
+  [hidden] { display: none !important; }
+
+  .top { display: flex; align-items: center; gap: 12px; margin: 4px 2px 16px; }
+  .top h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  .top .sub { margin: 0; color: var(--muted); font-size: 13px; }
+  .logo { width: 40px; height: 40px; flex: none; }
+
+  .card { background: var(--card); border-radius: 14px; padding: 16px; margin-bottom: 12px; box-shadow: var(--shadow); }
+  .card h2 { font-size: 15px; margin: 0 0 6px; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+  .card-head h2 { margin: 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12.5px; }
+  p { margin: 0 0 10px; }
+
+  button { font: inherit; border: 0; border-radius: 9px; padding: 8px 14px; cursor: pointer;
+           background: var(--field); color: var(--text); font-weight: 500; }
+  button:hover { filter: brightness(.97); }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: .45; cursor: default; transform: none; }
+  button.primary { background: var(--accent); color: var(--accent-text); }
+  button.big { width: 100%; padding: 12px; font-size: 15px; border-radius: 11px; }
+  button.danger { color: var(--red); }
+  button.link { background: none; padding: 4px 6px; color: var(--accent); }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .list { list-style: none; margin: 4px 0 0; padding: 0; }
+  .list li { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
+  .list li:first-child { border-top: 0; }
+  .grow { flex: 1; min-width: 0; }
+  .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mac { width: 30px; height: 30px; border-radius: 8px; background: var(--accent-soft); color: var(--accent);
+         display: grid; place-items: center; flex: none; }
+
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--grey); flex: none; }
+  .dot.in_sync { background: var(--green); }
+  .dot.syncing, .dot.waiting { background: var(--yellow); }
+  .dot.no_audio, .dot.bad { background: var(--red); }
+  .dot.pulse { animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(40,167,69,.5); } 70% { box-shadow: 0 0 0 8px rgba(40,167,69,0); } 100% { box-shadow: 0 0 0 0 rgba(40,167,69,0); } }
+  .live { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
+
+  .meter { height: 10px; background: var(--field); border-radius: 6px; overflow: hidden; margin: 6px 0 10px; }
+  .meter div { height: 100%; width: 0; background: linear-gradient(90deg, var(--green), var(--yellow)); border-radius: 6px;
+               transition: width .15s linear; }
+
+  .row { display: flex; gap: 8px; align-items: center; }
+  input[type=text] { flex: 1; min-width: 0; font: inherit; padding: 8px 10px; border-radius: 9px; border: 1px solid var(--line);
+                     background: var(--field); color: var(--text); }
+  .empty { display: flex; align-items: center; gap: 10px; color: var(--muted); padding: 10px 0; }
+  .spinner { width: 14px; height: 14px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%;
+             animation: spin .8s linear infinite; flex: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .help { background: var(--field); border-radius: 10px; padding: 10px 12px; margin: 8px 0 10px; font-size: 13px; }
+  .help ul { margin: 6px 0 0; padding-left: 18px; }
+  .help li { margin: 2px 0; }
+  .setup { border: 1px solid var(--accent); background: var(--accent-soft); border-radius: 12px; padding: 12px; margin: 10px 0 12px; }
+  .setup .row { margin-top: 8px; flex-wrap: wrap; }
+
+  .ctl { display: flex; align-items: center; gap: 12px; padding: 8px 0; }
+  .ctl > span { width: 92px; flex: none; color: var(--muted); }
+  input[type=range] { flex: 1; accent-color: var(--accent); }
+  .nudge { display: flex; align-items: center; gap: 6px; }
+  .nudge button { width: 34px; padding: 6px 0; font-size: 16px; }
+  .nudge output { min-width: 62px; text-align: center; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .seg { display: inline-flex; background: var(--field); border-radius: 9px; padding: 2px; }
+  .seg button { background: none; padding: 6px 12px; border-radius: 7px; }
+  .seg button.on { background: var(--seg-on); box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+
+  .status-big { display: flex; align-items: center; gap: 12px; margin: 6px 0 12px; }
+  .status-big .dot { width: 14px; height: 14px; }
+  .status-big .title { font-size: 18px; font-weight: 650; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stats div { background: var(--field); border-radius: 10px; padding: 8px 10px; }
+  .stats b { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
+  .stats label { color: var(--muted); font-size: 12px; }
+
+  .banner { display: flex; gap: 10px; align-items: flex-start; background: #fff1f0; color: #8a1c1c; border-radius: 12px;
+            padding: 10px 12px; margin-bottom: 12px; }
+  @media (prefers-color-scheme: dark) { .banner { background: #3a1f1f; color: #ffb4b0; } }
+  .banner .grow button { margin-top: 6px; }
+  .banner .x { background: none; color: inherit; padding: 0 4px; font-size: 18px; line-height: 1; }
+
+  details.settings summary { cursor: pointer; font-weight: 600; list-style: none; }
+  details.settings summary::-webkit-details-marker { display: none; }
+  details.settings summary::after { content: "›"; float: right; color: var(--muted); transition: transform .2s; }
+  details.settings[open] summary::after { transform: rotate(90deg); }
+  details.settings .ctl > span { width: 150px; }
+  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body data-token="__TOKEN__">
+<main>
+  <header class="top">
+    <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+      <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7d7aff"/><stop offset="1" stop-color="#4b48d6"/></linearGradient></defs>
+      <rect width="64" height="64" rx="15" fill="url(#g)"/>
+      <g fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round">
+        <path d="M21 25a10 10 0 0 0 0 14"/><path d="M15 20a17 17 0 0 0 0 24"/>
+        <path d="M43 25a10 10 0 0 1 0 14"/><path d="M49 20a17 17 0 0 1 0 24"/>
+      </g>
+      <circle cx="32" cy="32" r="4.5" fill="#fff"/>
+    </svg>
+    <div>
+      <h1>SyncAudio</h1>
+      <p class="sub" id="this-mac">&nbsp;</p>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" role="alert" hidden>
+    <div class="grow"><div id="banner-text"></div><div id="banner-actions"></div></div>
+    <button class="x" data-action="dismiss" aria-label="Dismiss">×</button>
+  </div>
+
+  <!-- ============================== idle -->
+  <section id="view-idle" hidden>
+    <div class="card">
+      <h2>Share this Mac's audio</h2>
+      <p class="muted">Play Spotify, YouTube or anything else. Every Mac that joins plays it at the same moment.</p>
+      <div class="setup" id="setup" hidden>
+        <div id="setup-text"></div>
+        <div class="row" id="setup-actions"></div>
+      </div>
+      <button class="primary big" id="btn-share">Start sharing</button>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>Join a Mac that's sharing</h2></div>
+      <ul class="list" id="nearby"></ul>
+      <div class="empty" id="nearby-empty"><span class="spinner"></span><span>Looking for Macs sharing on this Wi-Fi…</span></div>
+      <div class="help" id="nearby-help" hidden>
+        <b>Not showing up?</b>
+        <ul>
+          <li>On the other Mac, open SyncAudio and click <b>Start sharing</b>.</li>
+          <li>Both Macs must be on the same Wi-Fi (not a guest network).</li>
+          <li>If macOS asked to let SyncAudio find devices on your network, choose <b>Allow</b>.
+            <button class="link" data-open="local_network">Open Local Network settings</button></li>
+          <li>Or type the address the sharing Mac shows below.</li>
+        </ul>
+      </div>
+      <form class="row" id="manual" autocomplete="off">
+        <input type="text" id="manual-address" placeholder="Address, e.g. 192.168.1.23" spellcheck="false">
+        <button type="submit">Join</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Add more Macs</h2>
+      <p class="muted">Any number of Macs can join. Each one just needs SyncAudio.</p>
+      <div class="row">
+        <button id="btn-copy">Copy download link</button>
+        <button class="link" data-open="download">Open download page</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== hosting -->
+  <section id="view-hosting" hidden>
+    <div class="card">
+      <div class="card-head">
+        <div class="live"><span class="dot in_sync pulse"></span>Sharing this Mac</div>
+        <button class="danger" data-action="stop">Stop</button>
+      </div>
+      <div class="meter" aria-label="Input level"><div id="meter"></div></div>
+      <p class="muted" id="host-hint"></p>
+      <div class="help" id="host-silent" hidden>
+        <b>Playing something but the bar isn't moving?</b>
+        <ul>
+          <li>Allow SyncAudio to use the microphone. It only listens to BlackHole, never your real mic.
+            <button class="link" data-open="microphone">Open Microphone settings</button></li>
+          <li>Check the Mac's sound output is <b>BlackHole 2ch</b>.
+            <button class="link" data-open="sound">Open Sound settings</button></li>
+        </ul>
+      </div>
+      <button id="btn-click">Play test clicks</button>
+    </div>
+
+    <div class="card">
+      <h2>Speakers</h2>
+      <ul class="list" id="speakers"></ul>
+      <p class="muted small" id="join-hint"></p>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Delay</h2>
+        <div class="seg" id="delay-mode"><button data-mode="auto">Auto</button><button data-mode="manual">Manual</button></div>
+      </div>
+      <div class="ctl" id="delay-manual" hidden>
+        <input type="range" id="delay" min="60" max="1000" step="10" aria-label="Delay">
+        <b id="delay-value" style="min-width:64px;text-align:right"></b>
+      </div>
+      <p class="muted small" id="delay-text"></p>
+    </div>
+  </section>
+
+  <!-- ============================== listening -->
+  <section id="view-listening" hidden>
+    <div class="card">
+      <div class="card-head">
+        <h2 id="listen-title">Listening</h2>
+        <button class="danger" data-action="stop">Leave</button>
+      </div>
+      <div class="status-big">
+        <span class="dot" id="listen-dot"></span>
+        <div><div class="title" id="listen-status"></div><div class="muted small" id="listen-detail"></div></div>
+      </div>
+      <div class="stats">
+        <div><b id="st-wifi">–</b><label>Wi-Fi delay</label></div>
+        <div><b id="st-delay">–</b><label>Audio delay</label></div>
+        <div><b id="st-drop">0</b><label>Dropouts</label></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== this Mac's controls (moved into the active view) -->
+  <div class="card" id="controls" hidden>
+    <h2>This Mac</h2>
+    <div class="ctl"><span>Volume</span><input type="range" id="volume" min="0" max="100" aria-label="Volume"></div>
+    <div class="ctl"><span>Sync nudge</span>
+      <div class="nudge">
+        <button data-nudge="-1" aria-label="Earlier">−</button><output id="offset">0 ms</output>
+        <button data-nudge="1" aria-label="Later">+</button>
+        <button class="link" id="nudge-reset">Reset</button>
+      </div>
+    </div>
+    <p class="muted small">Hear an echo or a double beat between the Macs? Nudge this one until they sound like a single speaker. Shift-click moves 10 ms.</p>
+    <div class="ctl"><span>Play</span>
+      <div class="seg" id="channel"><button data-ch="both">Both sides</button><button data-ch="left">Left</button><button data-ch="right">Right</button></div>
+    </div>
+    <p class="muted small">Two Macs a few metres apart? Set one to Left and the other to Right for stereo.</p>
+  </div>
+
+  <details class="card settings" id="settings">
+    <summary>Settings</summary>
+    <div class="ctl"><span>This Mac's name</span><input type="text" id="name" maxlength="40"></div>
+    <div class="ctl"><span>Play on this Mac while sharing</span><input type="checkbox" id="play-local"></div>
+  </details>
+
+  <footer id="footer"></footer>
+</main>
+
+<script>
+"use strict";
+const TOKEN = document.body.dataset.token;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+let state = null;
+let offline = false;
+const editedAt = {};          // control id -> last time the person touched it
+const touched = (id) => { editedAt[id] = Date.now(); };
+const fresh = (id) => Date.now() - (editedAt[id] || 0) > 1500;
+
+async function call(path, body) {
+  const init = body === undefined
+    ? {headers: {"X-Token": TOKEN}}
+    : {method: "POST", headers: {"X-Token": TOKEN, "Content-Type": "application/json"}, body: JSON.stringify(body)};
+  const res = await fetch(path, init);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  offline = false;
+  render(await res.json());
+}
+const post = (action, body = {}) => call("/api/" + action, body).catch(() => { offline = true; render(state); });
+
+async function poll() {
+  try { await call("/api/state"); } catch (e) { offline = true; render(state); }
+  setTimeout(poll, 500);
+}
+
+function setHTML(el, html) { if (el.innerHTML !== html) el.innerHTML = html; }
+function show(el, on) { el.hidden = !on; }
+const macIcon = '<span class="mac"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M2 20h20"/></svg></span>';
+const ms = (v) => v == null ? "–" : v < 1 ? "<1 ms" : Math.round(v) + " ms";
+
+const STATE_TEXT = {in_sync: "In sync", syncing: "Getting in sync…", waiting: "Connecting…", no_audio: "Audio arriving late"};
+
+function render(s) {
+  if (!s) return;
+  state = s;
+  const mode = s.mode;
+  $("this-mac").textContent = "This Mac: " + s.name;
+  for (const m of ["idle", "hosting", "listening"]) show($("view-" + m), mode === m);
+  renderBanner(s);
+  if (mode === "idle") renderIdle(s);
+  if (mode === "hosting") renderHosting(s);
+  if (mode === "listening") renderListening(s);
+  renderControls(s);
+  $("footer").textContent = `${s.app.name} ${s.app.version}`;
+}
+
+function renderBanner(s) {
+  let text = "", actions = "";
+  if (offline) text = "Lost contact with SyncAudio. Is the app still running?";
+  else if (s.error && s.error.code !== "no_blackhole") {
+    text = esc(s.error.message);
+    if (s.error.code === "port_busy") actions = "";
+  }
+  show($("banner"), !!text);
+  setHTML($("banner-text"), text);
+  setHTML($("banner-actions"), actions);
+}
+
+function renderIdle(s) {
+  // One-time BlackHole setup, only needed for sharing.
+  const inst = s.install || {state: "idle"};
+  const needSetup = s.blackhole === false || ["downloading", "installing", "restart"].includes(inst.state);
+  show($("setup"), needSetup);
+  $("btn-share").disabled = s.blackhole === false;
+  if (needSetup) {
+    let text, actions = "";
+    if (inst.state === "downloading" || inst.state === "installing") {
+      text = `<div class="row"><span class="spinner"></span><span>${esc(inst.message)}</span></div>`;
+    } else if (inst.state === "restart") {
+      text = `<b>Almost there.</b> ${esc(inst.message)}`;
+      actions = `<button data-action="check-devices">Check again</button>`;
+    } else {
+      text = `<b>One-time setup.</b> To share, SyncAudio needs <b>BlackHole</b>, a free audio driver that lets it hear what this Mac plays. It takes a minute and asks for your Mac password. (Joining doesn't need it.)`;
+      if (inst.state === "failed" || inst.message) text += `<p class="small" style="margin:8px 0 0">${esc(inst.message)}</p>`;
+      actions = `<button class="primary" data-action="install-blackhole">Install BlackHole</button>
+                 <button class="link" data-open="blackhole">What's BlackHole?</button>`;
+    }
+    setHTML($("setup-text"), text);
+    setHTML($("setup-actions"), actions);
+  }
+
+  const items = s.nearby.map((h) =>
+    `<li>${macIcon}<div class="grow"><div class="name">${esc(h.name)}</div><div class="muted small">${esc(h.address)}</div></div>
+      <button class="primary" data-join="${esc(h.address)}">Join</button></li>`).join("");
+  setHTML($("nearby"), items);
+  show($("nearby-empty"), !s.nearby.length);
+  show($("nearby-help"), !s.nearby.length && s.idle_s > 8);
+  if (fresh("manual-address") && !$("manual-address").value && s.last_host) $("manual-address").value = s.last_host;
+}
+
+function speakerRow(name, st, detail) {
+  return `<li><span class="dot ${st}"></span><div class="grow"><div class="name">${esc(name)}</div>
+          <div class="muted small">${esc(detail)}</div></div></li>`;
+}
+
+function renderHosting(s) {
+  const h = s.session;
+  $("meter").style.width = Math.min(100, Math.sqrt(h.level) * 100) + "%";
+  let hint;
+  if (h.click) hint = "Playing test clicks. Put the Macs side by side: one crisp click means they're in sync. A double click? Use Sync nudge on the other Mac.";
+  else if (h.silent_s < 2) hint = "Sharing everything this Mac plays.";
+  else hint = "Play something on this Mac (Spotify, YouTube, anything).";
+  $("host-hint").textContent = hint;
+  show($("host-silent"), !h.click && h.silent_s > 20);
+  $("btn-click").textContent = h.click ? "Back to this Mac's audio" : "Play test clicks";
+
+  let rows = "";
+  if (h.local) rows += speakerRow("This Mac", h.local.state, (STATE_TEXT[h.local.state] || "") + (h.output ? " · " + h.output : ""));
+  for (const l of h.listeners) {
+    let detail = STATE_TEXT[l.state] || "Connecting…";
+    if (l.wifi_ms != null) detail += ` · Wi-Fi ${ms(l.wifi_ms)}`;
+    if (l.dropouts) detail += ` · ${l.dropouts} dropout${l.dropouts === 1 ? "" : "s"}`;
+    rows += speakerRow(l.name, l.state, detail);
+  }
+  setHTML($("speakers"), rows);
+  $("join-hint").innerHTML = h.listeners.length
+    ? `${h.listeners.length} Mac${h.listeners.length === 1 ? "" : "s"} listening. More can join any time.`
+    : `No one has joined yet. On another Mac, open SyncAudio: this Mac shows up under <b>Join</b>. Address: <b>${esc(s.address)}</b>`;
+
+  for (const b of $("delay-mode").children) b.classList.toggle("on", (b.dataset.mode === "auto") === h.auto_delay);
+  show($("delay-manual"), !h.auto_delay);
+  if (fresh("delay")) $("delay").value = h.delay_ms;
+  $("delay-value").textContent = ms(fresh("delay") ? h.delay_ms : $("delay").value);
+  $("delay-text").textContent = h.auto_delay
+    ? `Now ${h.delay_ms} ms. SyncAudio keeps it as low as your Wi-Fi allows and raises it if anyone's audio arrives late.`
+    : "Lower means less lag behind video. Higher means fewer dropouts on weak Wi-Fi.";
+}
+
+function renderListening(s) {
+  const c = s.session;
+  const host = c.host_name || c.address;
+  $("listen-title").textContent = "Listening to " + host;
+  let dot = "waiting", title, detail = "";
+  if (c.connection === "connected") {
+    dot = c.state;
+    title = c.clock ? (STATE_TEXT[c.state] || "Connecting…") : "Syncing clocks…";
+    if (c.state === "in_sync") detail = "Playing on " + c.output;
+    if (c.state === "no_audio") detail = "Wi-Fi hiccup. The sharing Mac raises the delay automatically.";
+  } else if (c.connection === "retrying") {
+    dot = "bad"; title = "Can't reach " + host;
+    detail = "Make sure it's still sharing and both Macs are on the same Wi-Fi. Retrying…";
+  } else {
+    title = "Connecting to " + host + "…";
+  }
+  if (c.error) detail = c.error;
+  $("listen-dot").className = "dot " + dot;
+  $("listen-status").textContent = title;
+  $("listen-detail").textContent = detail;
+  $("st-wifi").textContent = ms(c.wifi_ms);
+  $("st-delay").textContent = ms(c.delay_ms);
+  $("st-drop").textContent = c.dropouts ?? 0;
+}
+
+function renderControls(s) {
+  const st = s.settings;
+  const target = s.mode === "hosting" ? $("view-hosting") : s.mode === "listening" ? $("view-listening") : null;
+  const visible = !!target && !(s.mode === "hosting" && !s.session.local);
+  if (visible && $("controls").parentElement !== target) target.appendChild($("controls"));
+  show($("controls"), visible);
+  if (fresh("volume")) $("volume").value = Math.round(st.volume * 100);
+  $("offset").textContent = (st.offset_ms > 0 ? "+" : "") + Math.round(st.offset_ms) + " ms";
+  for (const b of $("channel").children) b.classList.toggle("on", b.dataset.ch === st.channel);
+  if (fresh("name") && document.activeElement !== $("name")) $("name").value = s.name;
+  $("play-local").checked = st.play_local;
+}
+
+// ------------------------------------------------------------------ events
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.action) post(b.dataset.action);
+  else if (b.dataset.open) post("open", {what: b.dataset.open});
+  else if (b.dataset.join) post("join", {address: b.dataset.join});
+  else if (b.dataset.nudge) {
+    const step = Number(b.dataset.nudge) * (e.shiftKey ? 10 : 1);
+    post("settings", {offset_ms: (state ? state.settings.offset_ms : 0) + step});
+  } else if (b.dataset.ch) post("settings", {channel: b.dataset.ch});
+  else if (b.dataset.mode) {
+    const auto = b.dataset.mode === "auto";
+    post("settings", {delay_ms: auto ? null : (state && state.session ? state.session.delay_ms : 150)});
+  }
+});
+$("btn-share").addEventListener("click", () => post("share"));
+$("btn-click").addEventListener("click", () => post("share", {click: !(state && state.session && state.session.click)}));
+$("nudge-reset").addEventListener("click", () => post("settings", {offset_ms: 0}));
+$("btn-copy").addEventListener("click", () => {
+  post("copy", {text: state ? state.app.download_url : ""});
+  $("btn-copy").textContent = "Copied!";
+  setTimeout(() => { $("btn-copy").textContent = "Copy download link"; }, 1500);
+});
+$("manual").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const address = $("manual-address").value.trim();
+  if (address) post("join", {address});
+});
+$("manual-address").addEventListener("input", () => touched("manual-address"));
+
+let volumeTimer = null;
+$("volume").addEventListener("input", () => {
+  touched("volume");
+  clearTimeout(volumeTimer);
+  volumeTimer = setTimeout(() => post("settings", {volume: $("volume").value / 100}), 80);
+});
+$("delay").addEventListener("input", () => { touched("delay"); $("delay-value").textContent = $("delay").value + " ms"; });
+$("delay").addEventListener("change", () => { touched("delay"); post("settings", {delay_ms: Number($("delay").value)}); });
+$("name").addEventListener("input", () => touched("name"));
+$("name").addEventListener("change", () => post("settings", {name: $("name").value}));
+$("play-local").addEventListener("change", () => post("settings", {play_local: $("play-local").checked}));
+
+poll();
+</script>
+</body>
+</html>

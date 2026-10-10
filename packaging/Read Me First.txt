@@ -1,0 +1,24 @@
+SyncAudio - play music on several Macs at once, in sync.
+
+INSTALL
+1. Drag SyncAudio onto the Applications folder.
+2. Open SyncAudio from Applications.
+
+THE FIRST TIME YOU OPEN IT
+macOS may say it "can't verify" SyncAudio, because it isn't from the
+App Store. To open it anyway:
+  1. Click "Done" (or "OK") in that message.
+  2. Open System Settings > Privacy & Security.
+  3. Scroll down and click "Open Anyway" next to SyncAudio, then confirm.
+You only have to do this once.
+
+When SyncAudio asks:
+  - "find devices on your local network"  -> Allow (needed to find the other Macs)
+  - "access the microphone"                -> Allow (only on the Mac that shares;
+                                              it listens to BlackHole, not your mic)
+
+USING IT
+- Mac playing the music: click "Start sharing". The first time it offers to
+  install BlackHole, a free audio driver; click Install and type your password.
+- Every other Mac: open SyncAudio and click "Join" next to the sharing Mac.
+- Any number of Macs can join. All of them need to be on the same Wi-Fi.

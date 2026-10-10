@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8b88ff"/>
+      <stop offset="1" stop-color="#4440d0"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+  <!-- macOS icon grid: 824px squircle-ish tile centred on a 1024 canvas -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)" filter="url(#shadow)"/>
+  <g fill="none" stroke="#fff" stroke-width="44" stroke-linecap="round">
+    <path d="M370 400a160 160 0 0 0 0 224"/>
+    <path d="M280 320a275 275 0 0 0 0 384"/>
+    <path d="M654 400a160 160 0 0 1 0 224"/>
+    <path d="M744 320a275 275 0 0 1 0 384"/>
+  </g>
+  <circle cx="512" cy="512" r="62" fill="#fff"/>
+</svg>
