@@ -14,15 +14,7 @@ concurrency:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14          # Apple Silicon (M1 and newer)
-            arch: AppleSilicon
-          - runner: macos-15-intel    # Intel Macs
-            arch: Intel
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-14       # Apple Silicon (M1 and newer)
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -68,16 +60,15 @@ jobs:
           cp -R dist/SyncAudio.app dmg/
           ln -s /Applications dmg/Applications
           cp "packaging/Read Me First.txt" dmg/
-          hdiutil create -volname "SyncAudio" -srcfolder dmg -ov -format UDZO "SyncAudio-${{ matrix.arch }}.dmg"
+          hdiutil create -volname "SyncAudio" -srcfolder dmg -ov -format UDZO SyncAudio.dmg
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SyncAudio-${{ matrix.arch }}
-          path: SyncAudio-${{ matrix.arch }}.dmg
+          name: SyncAudio
+          path: SyncAudio.dmg
 
   release:
-    needs: build
-    if: ${{ !cancelled() }}
+    needs: build          # only publish when both Macs built and passed every check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -94,10 +85,8 @@ jobs:
           cat > notes.md <<'NOTES'
           ## Download
 
-          - **Apple Silicon** (M1, M2, M3, M4 or newer): `SyncAudio-AppleSilicon.dmg`
-          - **Intel Mac**: `SyncAudio-Intel.dmg`
-
-          Not sure? Apple menu → About This Mac. "Chip: Apple M…" means Apple Silicon.
+          **[SyncAudio.dmg](https://github.com/farhanhaque0619/johnschuster/releases/latest/download/SyncAudio.dmg)**:
+          for Macs with Apple silicon (M1 or newer) running macOS 14 Sonoma or later.
 
           ## Install
 

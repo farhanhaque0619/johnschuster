@@ -27,7 +27,7 @@ app = BUNDLE(
     info_plist={
         "CFBundleDisplayName": "SyncAudio",
         "CFBundleShortVersionString": version,
-        "LSMinimumSystemVersion": "11.0",
+        "LSMinimumSystemVersion": "14.0",   # numpy wheels need Sonoma
         "LSApplicationCategoryType": "public.app-category.music",
         "NSHighResolutionCapable": True,
         # BlackHole is an input device, so capturing it needs microphone permission.

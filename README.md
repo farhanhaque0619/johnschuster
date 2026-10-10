@@ -12,12 +12,8 @@ and they sound like one bigger speaker, or like a stereo pair.
 
 ## Get it
 
-1. **Download** SyncAudio from the
-   [download page](https://github.com/farhanhaque0619/johnschuster/releases/latest):
-   * `SyncAudio-AppleSilicon.dmg` for M1, M2, M3, M4 or newer Macs
-   * `SyncAudio-Intel.dmg` for older Intel Macs
-
-   Not sure which you have? Apple menu → **About This Mac**. "Chip: Apple M…" means Apple Silicon.
+1. **Download [SyncAudio.dmg](https://github.com/farhanhaque0619/johnschuster/releases/latest/download/SyncAudio.dmg)**.
+   It's for Macs with Apple silicon (M1 or newer) running macOS 14 Sonoma or later.
 2. Open the `.dmg` and drag **SyncAudio** onto **Applications**.
 3. Open SyncAudio from Applications.
    * **"Apple could not verify SyncAudio…"**: click **Done**, open **System Settings →
@@ -101,9 +97,9 @@ python3 -m venv .venv
 ```
 
 **Build the .dmg:** pushing to `main` or `claude/dreamy-johnson-s8n24w` runs
-`.github/workflows/build-mac.yml`. On Apple Silicon and Intel Macs it runs the
+`.github/workflows/build-mac.yml`. On an Apple silicon Mac it runs the
 tests, builds `SyncAudio.app` with PyInstaller (`packaging/SyncAudio.spec`),
-self-tests it, packs the `.dmg` files, and publishes them on the
+self-tests it, packs `SyncAudio.dmg`, and publishes it on the
 [download page](https://github.com/farhanhaque0619/johnschuster/releases/latest).
 The app is ad-hoc signed, not notarized, which is why macOS asks you to confirm
 the first launch. With an Apple Developer account it could be signed and

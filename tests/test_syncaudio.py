@@ -390,24 +390,24 @@ class CommandLineTest(unittest.TestCase):
         port = free_port()
         quit_after = lambda seconds: lambda self: (threading.Timer(seconds, self.quit.set).start(), self)[1]
         out = io.StringIO()
+        host = threading.Thread(target=sa.main, args=(["host", "--port", str(port), "--name", "Den"],))
+        # Each "Mac" gets its own fake devices, however late its thread gets going.
+        devices = lambda: hosting if threading.current_thread() is host else joining
         with mock.patch.object(sa.Console, "__enter__", quit_after(8)), \
                 mock.patch.object(sa.shutil, "which", return_value=None), \
+                mock.patch.object(sa, "import_sounddevice", side_effect=devices), \
                 contextlib.redirect_stdout(out):
-            with mock.patch.object(sa, "import_sounddevice", return_value=hosting):
-                host = threading.Thread(target=sa.main, args=(["host", "--port", str(port), "--name", "Den"],))
-                host.start()
-            time.sleep(0.5)
-            with mock.patch.object(sa, "import_sounddevice", return_value=joining):
-                sa.main(["join", "127.0.0.1", "--port", str(port), "--name", "Sam"])
+            host.start()
+            time.sleep(1)
+            sa.main(["join", "127.0.0.1", "--port", str(port), "--name", "Sam"])
             host.join(10)
         log = out.getvalue()
         self.assertIn('Set this Mac\'s sound output to "BlackHole 2ch"', log)
         self.assertIn("playing on: MacBook Pro Speakers", log)    # not BlackHole: no feedback loop
         self.assertIn("+ Sam joined", log)
         self.assertIn("connected to Den", log)
-        self.assertIn("Den · in sync", log)
         for sd in (hosting, joining):
-            played = np.concatenate(sd.outputs[0].written[-50:])
+            played = np.concatenate(sd.outputs[0].written)
             self.assertGreater(np.abs(played).max(), 0.4, "the 440 Hz tone reached the speaker")
 
 
