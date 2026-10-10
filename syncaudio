@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+dir="$(cd "$(dirname "$0")" && pwd)"
+if [[ ! -x "$dir/.venv/bin/python" ]]; then
+  echo "Run ./setup.sh first (./setup.sh host on the Mac that shares its audio)."
+  exit 1
+fi
+exec "$dir/.venv/bin/python" "$dir/syncaudio.py" "$@"

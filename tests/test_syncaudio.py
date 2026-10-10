@@ -1,0 +1,415 @@
+"""Tests for syncaudio. No audio hardware needed: speakers are simulated.
+
+    python3 -m unittest discover tests
+"""
+import contextlib
+import heapq
+import io
+import os
+import socket
+import sys
+import threading
+import time
+import types
+import unittest
+from unittest import mock
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import syncaudio as sa  # noqa: E402
+
+RATE = 48000
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+class ClockSyncTest(unittest.TestCase):
+    def test_tracks_offset_and_drift_through_lopsided_wifi(self):
+        rng = np.random.default_rng(3)
+        offset, drift = 1234.5, 80e-6           # client clock = offset + T * (1 + drift)
+        local = lambda T: offset + T * (1 + drift)
+        clock = sa.ClockSync()
+        T, errors = 0.0, []
+        while T < 60:
+            up = 0.0015 + rng.exponential(0.003) + (0.08 if rng.random() < 0.05 else 0)
+            down = 0.001 + rng.exponential(0.002)
+            t1, t2 = local(T), T + up
+            t3 = t2 + 0.0001
+            t4 = local(t3 + down)
+            clock.add(t1, t2, t3, t4)
+            T = t3 + down + 0.2
+            if T > 10:
+                errors.append(clock.to_server(local(T + 0.1)) - (T + 0.1))
+        errors = np.abs(errors)
+        self.assertLess(np.percentile(errors, 95), 0.0008)
+        self.assertLess(errors.max(), 0.0015)
+
+    def test_unsynced_until_enough_pings(self):
+        clock = sa.ClockSync()
+        self.assertIsNone(clock.to_server(1.0))
+        for i in range(sa.ClockSync.MIN_SAMPLES):
+            clock.add(i, i + 0.001, i + 0.001, i + 0.002)
+        self.assertAlmostEqual(clock.to_server(100.0), 100.0, places=6)
+
+
+def simulate(seconds=45.0, delay=0.12, client_clock_ppm=80.0, host_dev_ppm=-35.0,
+             client_dev_ppm=60.0, stall_at=None, seed=1):
+    """Discrete-event simulation of one host and one friend.
+
+    Everything runs on 'true' time T. The host clock is T itself, the friend's
+    clock runs fast and is offset, both speakers run off their own crystals,
+    and the network is jittery with lopsided delays. Returns, per speaker, the
+    timing error of every output buffer (seconds; + = played early)."""
+    rng = np.random.default_rng(seed)
+    block = RATE * sa.BLOCK_MS // 1000
+    local = lambda T: 777.0 + T * (1 + client_clock_ppm * 1e-6)
+    clock = sa.ClockSync()
+    timeline = sa.Timeline(RATE)
+    players = {"host": sa.Player(RATE, 2, lambda t: t), "friend": sa.Player(RATE, 2, clock.to_server)}
+    to_local = {"host": lambda T: T, "friend": local}
+    devices = {"host": (512, host_dev_ppm, 0.025), "friend": (470, client_dev_ppm, 0.035)}
+    errors = {"host": [], "friend": []}
+
+    events, seq = [], 0
+
+    def at(T, kind, data=None):
+        nonlocal seq
+        seq += 1
+        heapq.heappush(events, (T, seq, kind, data))
+
+    at(0.0, "capture", 0)
+    at(0.0, "ping")
+    for name, (_, _, latency) in devices.items():
+        at(0.3, "callback", (name, 0, 0.3 + latency))
+
+    last_arrival = 0.0
+    while events:
+        T, _, kind, data = heapq.heappop(events)
+        if T > seconds:
+            break
+        if kind == "capture":                   # BlackHole is locked to the host clock
+            k = data
+            pcm = np.full((block, 2), 0.1, np.float32)
+            n, captured = timeline.stamp(block, k * block / RATE)
+            players["host"].feed(n, captured + delay, pcm)
+            arrival = T + block / RATE + 0.002 + rng.exponential(0.006)
+            if stall_at and stall_at <= T < stall_at + 0.3:
+                arrival = stall_at + 0.3 + 0.005    # Wi-Fi hiccup: everything waits
+            last_arrival = max(last_arrival, arrival)  # TCP keeps order
+            at(last_arrival, "deliver", (n, captured + delay, pcm))
+            at((k + 1) * block / RATE, "capture", k + 1)
+        elif kind == "deliver":
+            players["friend"].feed(*data)
+        elif kind == "ping":
+            up = 0.0015 + rng.exponential(0.003)
+            down = 0.001 + rng.exponential(0.002)
+            t1, t2 = local(T), T + up
+            clock.add(t1, t2, t2 + 1e-4, local(t2 + 1e-4 + down))
+            at(T + (0.03 if T < 2 else 0.2), "ping")
+        elif kind == "callback":
+            name, i, dac0 = data
+            frames, ppm, latency = devices[name]
+            dac = dac0 + i * frames / (RATE * (1 + ppm * 1e-6))
+            p = players[name]
+            before = p.read_n
+            out = p.render(frames, to_local[name](dac))
+            assert out.shape == (frames, 2)
+            if before is not None and p.read_n is not None:
+                intended = (dac - delay) * RATE     # sample index meant to be playing at dac
+                errors[name].append((dac, (before - intended) / RATE))
+            next_dac = dac0 + (i + 1) * frames / (RATE * (1 + ppm * 1e-6))
+            at(next_dac - latency, "callback", (name, i + 1, dac0))
+    return players, {k: np.array(v) for k, v in errors.items()}
+
+
+class PlayerSimulationTest(unittest.TestCase):
+    def assert_tight(self, errs, after, limit, label, skip=None):
+        e = errs[errs[:, 0] > after]
+        if skip:
+            e = e[(e[:, 0] < skip[0]) | (e[:, 0] > skip[1])]
+        worst = np.abs(e[:, 1]).max()
+        self.assertLess(worst, limit, f"{label}: worst error {worst * 1000:.2f} ms")
+        return worst
+
+    def test_two_macs_stay_in_sync_despite_drift(self):
+        players, errs = simulate()
+        h = self.assert_tight(errs["host"], 10, 0.0005, "host")
+        f = self.assert_tight(errs["friend"], 10, 0.0015, "friend")
+        print(f"\n  simulated worst error after 10 s: host {h * 1000:.2f} ms, friend {f * 1000:.2f} ms")
+        self.assertEqual(players["host"].resyncs, 0)
+        self.assertEqual(players["friend"].resyncs, 0)
+        self.assertEqual(players["host"].dropouts, 0)
+        self.assertEqual(players["friend"].dropouts, 0)
+
+    def test_extreme_drift(self):
+        players, errs = simulate(client_clock_ppm=-400, host_dev_ppm=300, client_dev_ppm=-300, seed=7)
+        self.assert_tight(errs["host"], 15, 0.001, "host")
+        self.assert_tight(errs["friend"], 15, 0.002, "friend")
+
+    def test_recovers_from_wifi_stall(self):
+        players, errs = simulate(stall_at=20.0, seed=2)
+        self.assertGreaterEqual(players["friend"].dropouts, 1)
+        # Timing never slips: the gap is played as silence, not by falling behind.
+        self.assert_tight(errs["friend"], 10, 0.0015, "friend")
+        self.assertEqual(players["friend"].resyncs, 0)
+
+
+class PlayerTest(unittest.TestCase):
+    def test_plays_each_sample_at_its_time(self):
+        p = sa.Player(RATE, 2, lambda t: t)
+        ramp = np.arange(RATE, dtype=np.float32)[:, None].repeat(2, 1) / RATE
+        p.feed(0, 10.0, ramp)                   # sample 0 is due at t=10
+        silent = p.render(100, 9.0)
+        self.assertFalse(silent.any())          # too early: silence
+        out = p.render(100, 10.5)               # first frame due at 10.5 -> sample 24000
+        self.assertAlmostEqual(out[0, 0], 24000 / RATE, places=4)
+
+    def test_channel_modes_and_volume(self):
+        settings = sa.Settings()
+        p = sa.Player(RATE, 2, lambda t: t, settings)
+        pcm = np.zeros((RATE, 2), np.float32)
+        pcm[:, 0], pcm[:, 1] = 0.2, 0.6
+        p.feed(0, 0.0, pcm)
+        np.testing.assert_allclose(p.render(10, 0.1)[0], [0.2, 0.6])
+        settings.channel = "right"
+        np.testing.assert_allclose(p.render(10, 0.2)[0], [0.6, 0.6])
+        settings.channel, settings.volume = "left", 0.5
+        np.testing.assert_allclose(p.render(10, 0.3)[0], [0.1, 0.1])
+        self.assertEqual(p.render(10, 0.4, out_channels=1).shape, (10, 1))
+
+    def test_offset_plays_later(self):
+        settings = sa.Settings(offset_ms=10)
+        p = sa.Player(RATE, 2, lambda t: t, settings)
+        p.feed(0, 0.0, np.arange(RATE, dtype=np.float32)[:, None].repeat(2, 1))
+        self.assertEqual(p.render(10, 0.5)[0, 0], 0.49 * RATE)
+
+    def test_new_stream_resets(self):
+        p = sa.Player(RATE, 2, lambda t: t)
+        p.feed(1000, 5.0, np.ones((240, 2), np.float32))
+        p.feed(0, 8.0, np.ones((240, 2), np.float32))   # host restarted
+        self.assertEqual((p.n_first, p.n_end), (0, 240))
+
+
+class TimelineTest(unittest.TestCase):
+    def test_smooths_jitter_and_follows_jumps(self):
+        rng = np.random.default_rng(0)
+        tl = sa.Timeline(RATE)
+        block = 240
+        for k in range(2000):
+            n, t = tl.stamp(block, 50.0 + k * block / RATE + rng.normal(0, 0.001))
+            if k > 500:     # settled: 1 ms of callback jitter is smoothed away
+                self.assertLess(abs(t - (50.0 + n / RATE)), 0.0003)
+        for k in range(2000, 2010):                 # the device stalls for 100 ms
+            n, t = tl.stamp(block, 50.1 + k * block / RATE)
+        self.assertLess(abs(t - (50.1 + n / RATE)), 0.002)
+
+    def test_follows_a_capture_device_with_its_own_clock(self):
+        tl = sa.Timeline(RATE)
+        block, fast = 240, 1 + 200e-6               # e.g. a USB interface running 200 ppm fast
+        for k in range(20000):                      # 100 s
+            n, t = tl.stamp(block, 7.0 + k * block / (RATE * fast))
+            if k > 2000:
+                self.assertLess(abs(t - (7.0 + n / (RATE * fast))), 0.0005)
+
+
+class FakeSpeaker:
+    """Behaves like a sound card: contiguous buffers on its own timeline."""
+
+    def __init__(self, rate, render, to_local, frames=480, latency=0.03):
+        self.latency, self.frames, self.rate = latency, frames, rate
+        self.render, self.to_local = render, to_local
+        self.records = []
+        self._stop = threading.Event()
+        self.dac0 = time.monotonic() + latency + 0.02
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        k = 0
+        while not self._stop.is_set():
+            dac = self.dac0 + k * self.frames / self.rate
+            wait = dac - self.latency - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            out = self.render(self.frames, self.to_local(dac), 2)
+            self.records.append((dac, out[:, 0].copy()))
+            k += 1
+
+    def close(self):
+        self._stop.set()
+
+    def onsets(self):
+        times = []
+        quiet = 0
+        for dac, block in list(self.records):
+            loud = np.flatnonzero(np.abs(block) > 0.05)
+            pos = 0
+            for i in loud:
+                if quiet + (i - pos) > 0.1 * self.rate:
+                    times.append(dac + i / self.rate)
+                quiet, pos = 0, i + 1
+            quiet += len(block) - pos
+        return np.array(times)
+
+
+class EndToEndTest(unittest.TestCase):
+    def test_host_and_friend_click_together(self):
+        port, delay = free_port(), 0.12
+        quiet = lambda *a: None
+        host = sa.Host(RATE, 2, delay, port, "test-host", log=quiet)
+        host.start()
+        host.local = sa.Player(RATE, 2, lambda t: t)
+        host_speaker = FakeSpeaker(RATE, host.local.render, lambda t: t, frames=512)
+
+        friend_clock = lambda t: 5000.0 + t * (1 + 150e-6)   # another Mac's clock
+        speakers = []
+
+        def open_output(rate, render):
+            speakers.append(FakeSpeaker(rate, render, friend_clock, frames=441, latency=0.04))
+            return speakers[-1]
+
+        client = sa.Client("127.0.0.1", open_output, port, "test-friend", log=quiet,
+                           now=lambda: friend_clock(time.monotonic()))
+        clicks = sa.ClickSource(RATE, 2, host.on_block)
+        clicks.start()
+        client.start()
+        try:
+            time.sleep(10)
+            status = host.status()
+        finally:
+            clicks.close()
+            client.stop()
+            host_speaker.close()
+            host.stop()
+
+        self.assertIn("test-friend in sync", status)
+        self.assertEqual(client.state, "playing")
+        h, f = host_speaker.onsets(), speakers[0].onsets()
+        cutoff = host.timeline.t0 + 5        # give clock sync a few seconds
+        h, f = h[h > cutoff], f[f > cutoff]
+        self.assertGreater(len(h), 8)
+        self.assertGreater(len(f), 8)
+        # Each click comes out of the host speaker when it was meant to...
+        intended = host.timeline.t0 + delay + np.round((h - host.timeline.t0 - delay) * 2) / 2
+        self.assertLess(np.abs(h - intended).max(), 0.001)
+        # ...and out of the friend's speaker at the same moment.
+        diffs = np.array([f[np.argmin(np.abs(f - t))] - t for t in h])
+        print(f"\n  end-to-end host vs friend: median {np.median(np.abs(diffs)) * 1000:.2f} ms, "
+              f"worst {np.abs(diffs).max() * 1000:.2f} ms")
+        self.assertLess(np.abs(diffs).max(), 0.002)
+
+    def test_discovery(self):
+        port = free_port()
+        host = sa.Host(RATE, 2, 0.1, port, "Living Room Mac", log=lambda *a: None)
+        host.start()
+        try:
+            self.assertEqual(sa.discover(port, address="127.0.0.1"), ("127.0.0.1", "Living Room Mac"))
+        finally:
+            host.stop()
+
+
+class FakeSoundDevice:
+    """Just enough of the sounddevice module: BlackHole, a mic and speakers,
+    with streams that call back on their own threads like CoreAudio does."""
+
+    class PortAudioError(Exception):
+        pass
+
+    DEVICES = [
+        {"name": "BlackHole 2ch", "max_input_channels": 2, "max_output_channels": 2, "default_samplerate": 48000.0},
+        {"name": "MacBook Pro Microphone", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 48000.0},
+        {"name": "MacBook Pro Speakers", "max_input_channels": 0, "max_output_channels": 2, "default_samplerate": 48000.0},
+    ]
+
+    def __init__(self):
+        self.default = types.SimpleNamespace(device=[0, 0])     # output already on BlackHole
+        self.outputs = []
+        fake = self
+
+        class Stream:
+            latency = 0.03
+
+            def __init__(self, samplerate, device, channels, dtype, callback, blocksize=0, latency=None):
+                self.rate, self.channels, self.callback = samplerate, channels, callback
+                self.frames = blocksize or 512
+                self.stop_event = threading.Event()
+                self.written = []
+
+            def start(self):
+                threading.Thread(target=self.run, daemon=True).start()
+
+            def stop(self):
+                self.stop_event.set()
+
+            def close(self):
+                pass
+
+        class OutputStream(Stream):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                fake.outputs.append(self)
+
+            def run(self):
+                epoch = 1000.0          # PortAudio's clock has its own epoch
+                dac0, k = time.monotonic() + 0.05, 0
+                while not self.stop_event.is_set():
+                    dac = dac0 + k * self.frames / self.rate
+                    time.sleep(max(0.0, dac - self.latency - time.monotonic()))
+                    out = np.zeros((self.frames, self.channels), np.float32)
+                    t = types.SimpleNamespace(currentTime=time.monotonic() + epoch, outputBufferDacTime=dac + epoch)
+                    self.callback(out, self.frames, t, None)
+                    self.written.append(out)
+                    k += 1
+
+        class InputStream(Stream):
+            def run(self):
+                t0, k = time.monotonic(), 0
+                while not self.stop_event.is_set():
+                    end = t0 + (k + 1) * self.frames / self.rate
+                    time.sleep(max(0.0, end - time.monotonic()))
+                    n = np.arange(k * self.frames, (k + 1) * self.frames)
+                    pcm = np.sin(2 * np.pi * 440 * n / self.rate)[:, None].repeat(self.channels, 1) * 0.5
+                    now = time.monotonic() + 1000.0
+                    t = types.SimpleNamespace(currentTime=now, inputBufferAdcTime=now - (time.monotonic() - end) - self.frames / self.rate)
+                    self.callback(pcm.astype(np.float32), self.frames, t, None)
+                    k += 1
+
+        self.OutputStream, self.InputStream = OutputStream, InputStream
+
+    def query_devices(self, device=None, kind=None):
+        return self.DEVICES if device is None else self.DEVICES[device]
+
+
+class CommandLineTest(unittest.TestCase):
+    def test_host_and_join_commands(self):
+        hosting, joining = FakeSoundDevice(), FakeSoundDevice()
+        port = free_port()
+        quit_after = lambda seconds: lambda self: (threading.Timer(seconds, self.quit.set).start(), self)[1]
+        out = io.StringIO()
+        with mock.patch.object(sa.Console, "__enter__", quit_after(8)), \
+                mock.patch.object(sa.shutil, "which", return_value=None), \
+                contextlib.redirect_stdout(out):
+            with mock.patch.object(sa, "import_sounddevice", return_value=hosting):
+                host = threading.Thread(target=sa.main, args=(["host", "--port", str(port), "--name", "Den"],))
+                host.start()
+            time.sleep(0.5)
+            with mock.patch.object(sa, "import_sounddevice", return_value=joining):
+                sa.main(["join", "127.0.0.1", "--port", str(port), "--name", "Sam"])
+            host.join(10)
+        log = out.getvalue()
+        self.assertIn('Set your Mac\'s sound output to "BlackHole 2ch"', log)
+        self.assertIn("playing on: MacBook Pro Speakers", log)    # not BlackHole: no feedback loop
+        self.assertIn("+ Sam joined", log)
+        self.assertIn("connected to Den", log)
+        self.assertIn("Den · in sync", log)
+        for sd in (hosting, joining):
+            played = np.concatenate(sd.outputs[0].written[-50:])
+            self.assertGreater(np.abs(played).max(), 0.4, "the 440 Hz tone reached the speaker")
+
+
+if __name__ == "__main__":
+    unittest.main()
