@@ -39,7 +39,7 @@ BLOCK_MS = 5                # capture block size
 OUTPUT_LATENCY = 0.04       # requested CoreAudio output buffer; compensated, so it only costs headroom
 
 # --------------------------------------------------------------------- wire
-HELLO, HEADER, AUDIO, STATS, UPDATE = b"H", b"C", b"A", b"S", b"U"
+HELLO, HEADER, AUDIO, STATS, UPDATE, CONTROL = b"H", b"C", b"A", b"S", b"U", b"K"
 FRAME = struct.Struct("<cI")        # kind, payload length
 AUDIO_HDR = struct.Struct("<qd")    # index of first sample, play_at (host clock)
 PING = struct.Struct("<cId")        # b"P", seq, t1
@@ -335,6 +335,17 @@ def import_sounddevice():
     return sounddevice
 
 
+def refresh_portaudio(sd):
+    """PortAudio only knows the devices that existed when it started (AirPods
+    connected later are invisible). Restart it; no streams may be open."""
+    if hasattr(sd, "_terminate"):
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+
+
 def find_device(sd, query: str, kind: str) -> int:
     devices = sd.query_devices()
     usable = [i for i, d in enumerate(devices) if d[f"max_{kind}_channels"] > 0]
@@ -455,6 +466,9 @@ class Host:
         self.lock = threading.Lock()
         self.peak = 0.0
         self.last_sound = None
+        self.group_volume = 1.0     # everyone's volume; any Mac may change it
+        self.group_volume_by = None
+        self._gain = 1.0            # what was applied to the last block
         self.running = False
 
     def start(self):
@@ -494,14 +508,23 @@ class Host:
             for p in self.peers:
                 p.alive = False
 
-    def set_delay(self, delay: float):
-        """Change the capture-to-speaker delay for everyone, live."""
-        self.delay = delay
-        data = frame(UPDATE, json.dumps({"delay": delay}).encode())
+    def _announce(self, **changes):
+        data = frame(UPDATE, json.dumps(changes).encode())
         with self.lock:
             peers = list(self.peers)
         for p in peers:
             p.push(data)
+
+    def set_delay(self, delay: float):
+        """Change the capture-to-speaker delay for everyone, live."""
+        self.delay = delay
+        self._announce(delay=delay)
+
+    def set_group_volume(self, volume: float, by: str | None = None):
+        """Everyone's volume (0..1). Applied here, before the audio is sent."""
+        self.group_volume = min(1.0, max(0.0, float(volume)))
+        self.group_volume_by = by or self.name
+        self._announce(group_volume=self.group_volume, by=self.group_volume_by)
 
     def on_block(self, pcm: np.ndarray, captured_at: float):
         """Called by the capture device for every block (audio thread)."""
@@ -511,6 +534,12 @@ class Host:
         self.peak = max(self.peak, peak)
         if peak > 1e-4:
             self.last_sound = time.monotonic()
+        target = self.group_volume
+        if target != self._gain:        # glide to the new volume over one block: no click
+            pcm = pcm * np.linspace(self._gain, target, len(pcm), dtype=np.float32)[:, None]
+            self._gain = target
+        elif target != 1.0:
+            pcm = pcm * np.float32(target)
         if self.local:
             self.local.feed(n, play_at, pcm)
         with self.lock:
@@ -567,8 +596,8 @@ class Host:
             if kind != HELLO or hello.get("magic") != MAGIC:
                 return
             sock.sendall(frame(HEADER, json.dumps({
-                "rate": self.rate, "channels": self.channels,
-                "delay": self.delay, "name": self.name}).encode()))
+                "rate": self.rate, "channels": self.channels, "delay": self.delay,
+                "group_volume": self.group_volume, "name": self.name}).encode()))
             peer = _Peer(sock, str(hello.get("name") or ip)[:40], ip)
             with self.lock:
                 self.peers.add(peer)
@@ -602,6 +631,11 @@ class Host:
                 kind, payload = recv_frame(peer.sock)
                 if kind == STATS:
                     peer.stats = json.loads(payload)
+                elif kind == CONTROL:
+                    request = json.loads(payload)
+                    if "group_volume" in request:
+                        self.set_group_volume(request["group_volume"], by=peer.name)
+                        self.log(f"{peer.name} set everyone's volume to {self.group_volume:.0%}")
         except (OSError, ValueError, ConnectionError):
             peer.alive = False
 
@@ -720,6 +754,11 @@ class Client:
         self.output = None
         self.host_name = None
         self.delay = None
+        self.group_volume = None
+        self.group_volume_by = None
+        self._sock = None
+        self._send_lock = threading.Lock()
+        self._output_lock = threading.Lock()
         self.phase = "searching"        # searching | connecting | connected | retrying
         self.error = None
         self.leads: deque = deque(maxlen=400)
@@ -739,8 +778,21 @@ class Client:
 
     def stop(self):
         self.running = False
-        if self.output:
-            self.output.close()
+        with self._output_lock:
+            if self.output:
+                self.output.close()
+                self.output = None
+
+    def reopen_output(self, before_open=None):
+        """Move playback to whatever device open_output picks now."""
+        with self._output_lock:
+            if self.output:
+                self.output.close()
+                self.output = None
+            if before_open:
+                before_open()
+            if self.player and self.running:
+                self.output = self.open_output(self.player.rate, self.player.render)
 
     def _run(self):
         while self.running:
@@ -778,17 +830,20 @@ class Client:
             rate, channels = int(hdr["rate"]), int(hdr["channels"])
             self.host_name = hdr.get("name", ip)
             self.delay = float(hdr.get("delay", 0))
+            self.group_volume = float(hdr.get("group_volume", 1.0))
             self.clock = ClockSync()
             self.leads.clear()
-            if self.player is None or (self.player.rate, self.player.channels) != (rate, channels):
-                if self.output:
-                    self.output.close()
-                    self.output = None
-                self.player = Player(rate, channels, self.to_server, self.settings)
-                self.output = self.open_output(rate, self.player.render)
-            else:
-                self.player.reset()
+            with self._output_lock:
+                if self.player is None or (self.player.rate, self.player.channels) != (rate, channels):
+                    if self.output:
+                        self.output.close()
+                        self.output = None
+                    self.player = Player(rate, channels, self.to_server, self.settings)
+                    self.output = self.open_output(rate, self.player.render)
+                else:
+                    self.player.reset()
             self.error = None
+            self._sock = sock
             threading.Thread(target=self._ping_loop, args=(ip, stop), daemon=True).start()
             self.phase = "connected"
             self.log(f"connected to {self.host_name} ({ip})")
@@ -803,13 +858,33 @@ class Client:
                     if server_now is not None:
                         self.leads.append(play_at - server_now)
                 elif kind == UPDATE:
-                    self.delay = float(json.loads(payload).get("delay", self.delay))
+                    update = json.loads(payload)
+                    self.delay = float(update.get("delay", self.delay))
+                    if "group_volume" in update:
+                        self.group_volume = float(update["group_volume"])
+                        self.group_volume_by = update.get("by")
                 if self.now() - last_stats >= 1.0:
                     last_stats = self.now()
-                    sock.sendall(frame(STATS, json.dumps(self.stats()).encode()))
+                    self._send(STATS, self.stats())
         finally:
             stop.set()
+            self._sock = None
             sock.close()
+
+    def _send(self, kind: bytes, message: dict):
+        sock = self._sock
+        if sock:
+            with self._send_lock:
+                sock.sendall(frame(kind, json.dumps(message).encode()))
+
+    def set_group_volume(self, volume: float):
+        """Ask the host to change everyone's volume."""
+        self.group_volume = min(1.0, max(0.0, float(volume)))
+        self.group_volume_by = self.name
+        try:
+            self._send(CONTROL, {"group_volume": self.group_volume})
+        except OSError:
+            pass
 
     def _ping_loop(self, ip: str, stop: threading.Event):
         started = self.now()
@@ -952,12 +1027,12 @@ class HostSession:
             if out_dev is not None:
                 self.host.local = Player(rate, channels, lambda t: t, self.settings)
                 self.output = SoundDeviceOutput(sd, out_dev, rate, self.host.local.render)
+            self.system = SystemOutput(self.log, self.switch_tool)
             if self.click:
                 self.source = ClickSource(rate, channels, self.host.on_block)
             else:
                 self.source = SoundDeviceInput(sd, in_dev, rate, channels, self.host.on_block)
                 if self.switch_output:
-                    self.system = SystemOutput(self.log, self.switch_tool)
                     self.system.switch_to(self.source.name, self.output.name if self.output else None)
             self.source.start()
         except sd.PortAudioError as e:
@@ -971,7 +1046,9 @@ class HostSession:
         return self
 
     def _tick_loop(self):
+        ticks = 0
         while not self._stop.wait(1.0):
+            ticks += 1
             if self.auto and self.host:
                 now = time.monotonic()
                 ready = {l["ip"] + l["name"]: l for l in self.host.listeners() if l["connected_s"] > 5}
@@ -979,6 +1056,46 @@ class HostSession:
                 if new is not None:
                     self.host.set_delay(new)
                     self.log(f"delay set to {new * 1000:.0f} ms to keep everyone fed")
+            if ticks % 2 == 0:
+                try:
+                    self._follow_output()
+                except Exception as e:
+                    self.log(f"! couldn't move to the new speaker: {e}")
+
+    def _follow_output(self):
+        """AirPods connecting (or picking another speaker) moves the Mac's sound
+        output away from BlackHole. Play this Mac's share there instead, and
+        point the output back at BlackHole so everyone keeps hearing the apps."""
+        if not (self.system and self.system.tool) or self._stop.is_set():
+            return
+        current = self.system.current()
+        if not current or "blackhole" in current.lower():
+            return
+        if self.output and not self.output_query and current != self.output.name:
+            self._reopen_audio(current)
+            self.log(f'This Mac now plays on "{current}".')
+        if not self.click and self.switch_output and isinstance(self.source, SoundDeviceInput):
+            self.system.previous = current
+            self.system.set(self.source.name)
+
+    def _reopen_audio(self, output_name: str):
+        sd, h = self.sd, self.host
+        restart_input = isinstance(self.source, SoundDeviceInput)
+        for thing in ([self.source] if restart_input else []) + [self.output]:
+            try:
+                thing.close()
+            except Exception:
+                pass
+        refresh_portaudio(sd)
+        try:
+            out_dev = find_device(sd, output_name, "output")
+        except SetupError:
+            out_dev = pick_output(sd, None)
+        self.output = SoundDeviceOutput(sd, out_dev, h.rate, h.local.render)
+        if restart_input:
+            in_dev = find_device(sd, self.input_query, "input")
+            self.source = SoundDeviceInput(sd, in_dev, h.rate, h.channels, h.on_block)
+            self.source.start()
 
     def set_delay(self, delay_ms: float | None):
         """None = automatic."""
@@ -1015,6 +1132,7 @@ class HostSession:
             "output": self.output.name if self.output else None,
             "level": round(h.take_level(), 3), "silent_s": round(self.silent_for(), 1),
             "delay_ms": round(h.delay * 1000), "auto_delay": self.auto is not None,
+            "group_volume": h.group_volume, "group_volume_by": h.group_volume_by,
             "local": player_info(h.local) if h.local else None,
             "listeners": h.listeners(),
         }
@@ -1041,22 +1159,52 @@ class JoinSession:
     """Listening: play a host's stream on this Mac."""
 
     def __init__(self, sd, address: str | None, name: str, output_query: str | None = None,
-                 settings: Settings | None = None, port: int = PORT, log=print):
+                 settings: Settings | None = None, port: int = PORT, switch_tool: str | None = None,
+                 log=print):
         self.sd, self.address, self.name, self.output_query = sd, address, name, output_query
         self.settings = settings or Settings()
-        self.port, self.log = port, log
+        self.port, self.switch_tool, self.log = port, switch_tool, log
         self.client = None
+        self._stop = threading.Event()
 
     def start(self):
         sd = self.sd
-        out_dev = pick_output(sd, self.output_query)
-        self.output_name = sd.query_devices(out_dev)["name"]
-        self.client = Client(self.address, lambda rate, render: SoundDeviceOutput(sd, out_dev, rate, render),
-                             self.port, self.name, self.settings, log=self.log)
+        self.output_name = sd.query_devices(pick_output(sd, self.output_query))["name"]
+        self.system = SystemOutput(self.log, self.switch_tool)
+        self.client = Client(self.address, self._open_output, self.port, self.name, self.settings, log=self.log)
         self.client.start()
+        threading.Thread(target=self._tick_loop, daemon=True).start()
         return self
 
+    def _open_output(self, rate: int, render):
+        sd = self.sd
+        try:
+            device = find_device(sd, self.output_name, "output")
+        except SetupError:
+            device = pick_output(sd, self.output_query)
+        self.output_name = sd.query_devices(device)["name"]
+        return SoundDeviceOutput(sd, device, rate, render)
+
+    def _tick_loop(self):
+        while not self._stop.wait(2.0):
+            try:
+                self._follow_output()
+            except Exception as e:
+                self.log(f"! couldn't move to the new speaker: {e}")
+
+    def _follow_output(self):
+        """Put AirPods in (or pick another speaker) and the music moves with you."""
+        if self.output_query or not self.system.tool:
+            return
+        current = self.system.current()
+        if not current or current == self.output_name or "blackhole" in current.lower():
+            return
+        self.output_name = current
+        self.client.reopen_output(before_open=lambda: refresh_portaudio(self.sd))
+        self.log(f'Now playing on "{self.output_name}".')
+
     def stop(self):
+        self._stop.set()
         if self.client:
             self.client.stop()
 
@@ -1066,6 +1214,7 @@ class JoinSession:
             "mode": "listening", "address": self.address, "host_name": c.host_name,
             "connection": c.phase, "output": self.output_name, "error": c.error,
             "delay_ms": round(c.delay * 1000) if c.delay is not None else None,
+            "group_volume": c.group_volume, "group_volume_by": c.group_volume_by,
             "clock": c.clock.estimate is not None, **c.stats(),
         }
 

@@ -241,10 +241,15 @@
     </div>
   </section>
 
-  <!-- ============================== this Mac's controls (moved into the active view) -->
+  <!-- ============================== volume + this Mac's controls (moved into the active view) -->
+  <div class="card" id="volumes" hidden>
+    <h2>Volume</h2>
+    <div class="ctl"><span>Everyone</span><input type="range" id="group-volume" min="0" max="100" aria-label="Volume for everyone"></div>
+    <p class="muted small" id="group-hint">Changes the volume on every Mac. Anyone listening can move it.</p>
+    <div class="ctl" id="local-volume"><span>This Mac</span><input type="range" id="volume" min="0" max="100" aria-label="This Mac's volume"></div>
+  </div>
   <div class="card" id="controls" hidden>
     <h2>This Mac</h2>
-    <div class="ctl"><span>Volume</span><input type="range" id="volume" min="0" max="100" aria-label="Volume"></div>
     <div class="ctl"><span>Sync nudge</span>
       <div class="nudge">
         <button data-nudge="-1" aria-label="Earlier">−</button><output id="offset">0 ms</output>
@@ -426,9 +431,22 @@ function renderListening(s) {
 function renderControls(s) {
   const st = s.settings;
   const target = s.mode === "hosting" ? $("view-hosting") : s.mode === "listening" ? $("view-listening") : null;
-  const visible = !!target && !(s.mode === "hosting" && !s.session.local);
-  if (visible && $("controls").parentElement !== target) target.appendChild($("controls"));
-  show($("controls"), visible);
+  const local = !!target && !(s.mode === "hosting" && !s.session.local);
+  for (const id of ["volumes", "controls"]) {
+    if (target && $(id).parentElement !== target) target.appendChild($(id));
+  }
+  show($("volumes"), !!target);
+  show($("controls"), local);
+  show($("local-volume"), local);
+  if (target) {
+    const g = s.session.group_volume;
+    $("group-volume").disabled = g == null;
+    if (fresh("group-volume") && g != null) $("group-volume").value = Math.round(g * 100);
+    const by = s.session.group_volume_by;
+    $("group-hint").textContent = by && by !== s.name && g != null
+      ? `Set to ${Math.round(g * 100)}% by ${by}. Changes the volume on every Mac.`
+      : "Changes the volume on every Mac. Anyone listening can move it.";
+  }
   if (fresh("volume")) $("volume").value = Math.round(st.volume * 100);
   $("offset").textContent = (st.offset_ms > 0 ? "+" : "") + Math.round(st.offset_ms) + " ms";
   for (const b of $("channel").children) b.classList.toggle("on", b.dataset.ch === st.channel);
@@ -467,12 +485,16 @@ $("manual").addEventListener("submit", (e) => {
 });
 $("manual-address").addEventListener("input", () => touched("manual-address"));
 
-let volumeTimer = null;
-$("volume").addEventListener("input", () => {
-  touched("volume");
-  clearTimeout(volumeTimer);
-  volumeTimer = setTimeout(() => post("settings", {volume: $("volume").value / 100}), 80);
-});
+const timers = {};
+function slider(id, send) {
+  $(id).addEventListener("input", () => {
+    touched(id);
+    clearTimeout(timers[id]);
+    timers[id] = setTimeout(() => send($(id).value / 100), 80);
+  });
+}
+slider("volume", (v) => post("settings", {volume: v}));
+slider("group-volume", (v) => post("settings", {group_volume: v}));
 $("delay").addEventListener("input", () => { touched("delay"); $("delay-value").textContent = $("delay").value + " ms"; });
 $("delay").addEventListener("change", () => { touched("delay"); post("settings", {delay_ms: Number($("delay").value)}); });
 $("name").addEventListener("input", () => touched("name"));

@@ -43,13 +43,29 @@ you like, and they all stay in sync.
 
 | Control       | What it does                                                                 |
 |---------------|------------------------------------------------------------------------------|
-| Volume        | This Mac's volume. On the sharing Mac, the keyboard volume keys set everyone's volume. |
+| Volume: Everyone | Changes the volume on **every** Mac at once. Anyone, sharing or listening, can move it, and everyone sees who changed it last. |
+| Volume: This Mac | Only this Mac. (On a listening Mac, the keyboard volume keys work too.) |
 | Sync nudge    | If you hear an echo or a double beat between Macs, nudge one until they sound like a single speaker. |
 | Both / Left / Right | Put two Macs apart, set one to Left and the other to Right: real stereo. |
 | Delay (sharing Mac) | **Auto** keeps it as low as the Wi-Fi allows and raises it if anyone's audio arrives late. |
 | Play test clicks | Plays a metronome to check the sync by ear: one crisp click = in sync. |
 
 When you click **Stop**, your Mac's sound goes back to its speakers.
+
+### AirPods and headphones
+
+They work, on any Mac, sharing or listening. Put them in whenever you like:
+SyncAudio notices when macOS switches the sound to them and moves the music
+over within a couple of seconds. On the sharing Mac it also keeps the sharing
+going, so everyone else still hears it.
+
+* SyncAudio never uses the AirPods' microphone, so they stay in full-quality
+  music mode. (Joining a call on them switches them to call mode, which sounds
+  worse. That's macOS, not SyncAudio.)
+* macOS tells SyncAudio how much delay Bluetooth adds, and SyncAudio
+  compensates. That estimate isn't perfect, though. If one person on AirPods
+  hears things slightly early or late compared to the speakers in the room,
+  use **Sync nudge** on their Mac.
 
 ## If something's off
 

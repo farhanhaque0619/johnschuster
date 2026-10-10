@@ -334,7 +334,7 @@ class FakeSoundDevice:
             latency = 0.03
 
             def __init__(self, samplerate, device, channels, dtype, callback, blocksize=0, latency=None):
-                self.rate, self.channels, self.callback = samplerate, channels, callback
+                self.rate, self.channels, self.callback, self.device = samplerate, channels, callback, device
                 self.frames = blocksize or 512
                 self.stop_event = threading.Event()
                 self.written = []
@@ -445,6 +445,95 @@ class AutoDelayTest(unittest.TestCase):
         self.assertIsNone(sa.AutoDelay().update(10, {}))
 
 
+def wait_until(check, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.2)
+    return False
+
+
+class AirPodsTest(unittest.TestCase):
+    """Putting AirPods in moves the Mac's output; SyncAudio should follow it."""
+
+    AIRPODS = {"name": "Farhan’s AirPods Pro", "max_input_channels": 1, "max_output_channels": 2,
+               "default_samplerate": 48000.0}
+    quiet = staticmethod(lambda *a: None)
+
+    @staticmethod
+    def fake_switch_tool(state):
+        """Stands in for SwitchAudioSource: reads and sets the Mac's output."""
+        def run(_self, *args):
+            if args[0] == "-c":
+                return state["output"]
+            state["output"] = args[1]
+            return ""
+        return mock.patch.object(sa.SystemOutput, "_run", run)
+
+    def connect_airpods(self, sd, state):
+        sd.DEVICES = sd.DEVICES + [self.AIRPODS]
+        state["output"] = self.AIRPODS["name"]          # what macOS does when they connect
+
+    def test_listener_moves_to_airpods(self):
+        port = free_port()
+        with mock.patch.object(sa.shutil, "which", return_value=None):
+            host = sa.HostSession(FakeSoundDevice(), "Den", port=port, log=self.quiet).start()
+        sd, state = FakeSoundDevice(), {"output": "MacBook Pro Speakers"}
+        with self.fake_switch_tool(state):
+            join = sa.JoinSession(sd, "127.0.0.1", "Sam", port=port, switch_tool="SwitchAudioSource",
+                                  log=self.quiet).start()
+            try:
+                self.assertTrue(wait_until(lambda: join.info()["state"] == "in_sync"))
+                self.connect_airpods(sd, state)
+                self.assertTrue(wait_until(lambda: join.info()["output"] == self.AIRPODS["name"]
+                                           and join.info()["state"] == "in_sync"), join.info())
+                airpods = sd.outputs[-1]
+                self.assertEqual(airpods.device, len(sd.DEVICES) - 1)
+                self.assertTrue(sd.outputs[0].stop_event.is_set(), "the speakers were let go")
+                self.assertTrue(wait_until(lambda: len(airpods.written) > 20))
+                self.assertGreater(np.abs(np.concatenate(airpods.written)).max(), 0.4)
+            finally:
+                join.stop()
+                host.stop()
+
+    def test_sharing_mac_moves_to_airpods_and_keeps_sharing(self):
+        sd, state = FakeSoundDevice(), {"output": "MacBook Pro Speakers"}
+        with self.fake_switch_tool(state):
+            host = sa.HostSession(sd, "Den", port=free_port(), switch_tool="SwitchAudioSource",
+                                  log=self.quiet).start()
+            try:
+                self.assertEqual(state["output"], "BlackHole 2ch")     # apps now play into SyncAudio
+                first_input = host.source
+                self.connect_airpods(sd, state)
+                self.assertTrue(wait_until(lambda: host.output.name == self.AIRPODS["name"]))
+                self.assertTrue(wait_until(lambda: state["output"] == "BlackHole 2ch"),
+                                "the Mac's output is put back on BlackHole so everyone keeps hearing it")
+                self.assertEqual(host.system.previous, self.AIRPODS["name"])
+                self.assertIsNot(host.source, first_input)
+                self.assertTrue(wait_until(lambda: host.info()["local"]["state"] == "in_sync"))
+                self.assertTrue(wait_until(lambda: len(sd.outputs[-1].written) > 20))
+                self.assertGreater(np.abs(np.concatenate(sd.outputs[-1].written)).max(), 0.4)
+            finally:
+                host.stop()
+        self.assertEqual(state["output"], self.AIRPODS["name"], "stopping hands the sound back to the AirPods")
+
+
+class GroupVolumeTest(unittest.TestCase):
+    def test_changes_glide_over_one_block(self):
+        host = sa.Host(RATE, 1, 0.1, free_port(), log=lambda *a: None)
+        host.local = sa.Player(RATE, 1, lambda t: t)
+        ones = np.ones((240, 1), np.float32)
+        host.on_block(ones, 0.0)
+        host.group_volume = 0.5
+        host.on_block(ones, 240 / RATE)
+        host.on_block(ones, 480 / RATE)
+        played = host.local.ring[:720, 0]
+        np.testing.assert_allclose(played[:240], 1.0)
+        self.assertTrue(np.all(np.diff(played[240:480]) <= 0) and played[240] == 1.0 and played[479] == 0.5)
+        np.testing.assert_allclose(played[480:], 0.5)
+
+
 class SessionTest(unittest.TestCase):
     """HostSession + JoinSession, the pieces the app is built from."""
 
@@ -480,12 +569,22 @@ class SessionTest(unittest.TestCase):
                 self.assertGreater(state["headroom_ms"], 150)
             self.assertEqual(host.info()["delay_ms"], 300)
             self.assertFalse(host.info()["auto_delay"])
+
+            # Sam turns everyone down to half.
+            sam, alex = listeners
+            sam.client.set_group_volume(0.5)
+            time.sleep(2)
+            self.assertEqual((host.info()["group_volume"], host.info()["group_volume_by"]), (0.5, "Sam"))
+            self.assertEqual((alex.info()["group_volume"], alex.info()["group_volume_by"]), (0.5, "Sam"))
+            for sd in [host_sd] + [l.sd for l in listeners]:
+                recent = np.abs(np.concatenate(sd.outputs[-1].written[-40:])).max()
+                self.assertAlmostEqual(recent, 0.25, delta=0.03)    # the 0.5 tone at half volume
         finally:
             for l in listeners:
                 l.stop()
             host.stop()
         for sd in [host_sd] + [l.sd for l in listeners]:
-            played = np.concatenate(sd.outputs[-1].written[-50:])
+            played = np.concatenate(sd.outputs[-1].written)
             self.assertGreater(np.abs(played).max(), 0.4, "the 440 Hz tone reached every speaker")
 
     def test_missing_blackhole_is_a_setup_error(self):

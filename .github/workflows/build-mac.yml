@@ -54,6 +54,21 @@ jobs:
           /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" dist/SyncAudio.app/Contents/Info.plist
           dist/SyncAudio.app/Contents/MacOS/SyncAudio --self-test
 
+      - name: Open the real window once
+        run: |
+          dist/SyncAudio.app/Contents/MacOS/SyncAudio --smoke-test &
+          app=$!
+          sleep 3
+          screencapture -x window.png || true
+          wait $app
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: window-screenshot
+          path: window.png
+          if-no-files-found: ignore
+
       - name: Make the .dmg
         run: |
           mkdir dmg

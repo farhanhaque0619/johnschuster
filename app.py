@@ -129,12 +129,8 @@ class Controller:
     def refresh_devices(self):
         """Re-read the audio device list (after installing BlackHole, say)."""
         sd = self.sd
-        if self.session is None and hasattr(sd, "_terminate"):
-            try:
-                sd._terminate()
-                sd._initialize()
-            except Exception:
-                pass
+        if self.session is None:
+            sa.refresh_portaudio(sd)
         self.blackhole = any("blackhole" in d["name"].lower() for d in sd.query_devices())
 
     def _scan_loop(self):
@@ -187,7 +183,7 @@ class Controller:
             self.error = None
             try:
                 self.session = sa.JoinSession(self.sd, address, self.name, settings=self.settings,
-                                              port=self.port, log=self._log).start()
+                                              port=self.port, switch_tool=self.switch_tool, log=self._log).start()
             except Exception as e:
                 return self._fail(e)
             self.prefs["last_host"] = address
@@ -206,6 +202,11 @@ class Controller:
             s.offset_ms = min(500.0, max(-500.0, float(data["offset_ms"])))
         if data.get("channel") in ("both", "left", "right"):
             s.channel = data["channel"]
+        if "group_volume" in data:
+            if isinstance(self.session, sa.HostSession) and self.session.host:
+                self.session.host.set_group_volume(data["group_volume"], by=self.name)
+            elif isinstance(self.session, sa.JoinSession) and self.session.client:
+                self.session.client.set_group_volume(data["group_volume"])
         if "name" in data and str(data["name"]).strip():
             self.name = self.prefs["name"] = str(data["name"]).strip()[:40]
         if "delay_ms" in data:
@@ -283,6 +284,10 @@ class Controller:
                 self._fail(e)
         session = self.session
         info = session.info() if session else None
+        previous = getattr(getattr(session, "system", None), "previous", None)
+        if isinstance(session, sa.HostSession) and previous and self.prefs.get("restore_output") != previous:
+            self.prefs["restore_output"] = previous
+            self._save_prefs()
         s = self.settings
         return {
             "app": {"name": APP_NAME, "version": VERSION, "download_url": DOWNLOAD_URL},
@@ -411,6 +416,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog=APP_NAME)
     ap.add_argument("--browser", action="store_true", help="open in the browser instead of a window")
     ap.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     args, _ = ap.parse_known_args(argv)     # Finder may add its own arguments
     if args.self_test:
         sys.exit(self_test())
@@ -425,9 +431,22 @@ def main(argv=None):
             import webview
         except ImportError:
             pass
+    result = {"ok": not args.smoke_test}
     try:
         if webview:
-            webview.create_window(APP_NAME, url, width=460, height=780, min_size=(400, 600))
+            window = webview.create_window(APP_NAME, url, width=460, height=780, min_size=(400, 600))
+            if args.smoke_test:     # the build opens the real window once, checks the UI drew, and quits
+                def check():
+                    time.sleep(4)
+                    shown = window.evaluate_js("!document.getElementById('view-idle').hidden && "
+                                               "document.getElementById('this-mac').textContent")
+                    print("window shows:", shown, flush=True)
+                    result["ok"] = bool(shown)
+                    window.destroy()
+                window.events.loaded += lambda: threading.Thread(target=check, daemon=True).start()
+                guard = threading.Timer(30, window.destroy)     # never hang the build
+                guard.daemon = True
+                guard.start()
             webview.start()
         else:
             webbrowser.open(url)
@@ -440,6 +459,8 @@ def main(argv=None):
         controller.shutdown()
         server.shutdown()
         server.server_close()
+    if not result["ok"]:
+        sys.exit("smoke test: the window didn't show the app")
 
 
 if __name__ == "__main__":

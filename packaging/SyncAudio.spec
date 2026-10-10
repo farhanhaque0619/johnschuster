@@ -34,6 +34,8 @@ app = BUNDLE(
         "NSMicrophoneUsageDescription":
             "SyncAudio listens to the BlackHole audio driver to share what this Mac is playing. "
             "It never uses your real microphone.",
+        # The window shows the app's own page from http://127.0.0.1.
+        "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
         "NSLocalNetworkUsageDescription":
             "SyncAudio finds and connects to other Macs on your Wi-Fi so they can play music in sync.",
     },
