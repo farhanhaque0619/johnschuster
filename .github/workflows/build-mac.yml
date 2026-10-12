@@ -53,7 +53,7 @@ jobs:
 
       - name: Check the built app
         run: |
-          codesign --verify --deep --strict --verbose=2 dist/SyncAudio.app
+          codesign --verify --deep --strict dist/SyncAudio.app
           /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" dist/SyncAudio.app/Contents/Info.plist
           dist/SyncAudio.app/Contents/MacOS/SyncAudio --self-test
 
@@ -145,6 +145,18 @@ jobs:
           Then: **Start sharing** on the Mac playing music, **Join** on every other Mac.
           NOTES
           sed -i 's/^          //' notes.md
+          # What the app's updater reads (a plain download, not the rate-limited GitHub API).
+          printf '{"version": "1.0.%s", "commit": "%s"}\n' "$GITHUB_RUN_NUMBER" "$GITHUB_SHA" > dmgs/latest.json
           gh release delete app-latest --repo "$REPO" --yes --cleanup-tag || true
-          gh release create app-latest dmgs/*.dmg --repo "$REPO" --target "$GITHUB_SHA" --latest \
+          gh release create app-latest dmgs/*.dmg dmgs/latest.json --repo "$REPO" --target "$GITHUB_SHA" --latest \
             --title "SyncAudio 1.0.${{ github.run_number }}" --notes-file notes.md
+
+      - name: Check the app's update check sees this build
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL "https://github.com/$REPO/releases/download/app-latest/latest.json" | tee /dev/stderr | grep -q "$GITHUB_SHA" && exit 0
+            sleep 10
+          done
+          exit 1

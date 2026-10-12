@@ -124,6 +124,27 @@ class ProbeTest(unittest.TestCase):
         self.assertIn("Local Network", sa.explain(OSError(errno.EHOSTUNREACH, "x"))["message"])
 
 
+class QuitTest(unittest.TestCase):
+    def test_quitting_stops_the_background_search(self):
+        stopped = []
+
+        class FakeBrowser:
+            found = {}
+
+            def start(self):
+                return self
+
+            def stop(self):
+                stopped.append(True)
+
+        from unittest import mock
+        with mock.patch.object(discovery, "Browser", FakeBrowser):
+            c = app.Controller(sd=FakeSoundDevice(), prefs_file=Path(tempfile.mkdtemp()) / "p.json", port=free_port())
+            self.assertTrue(wait_until(lambda: c.browser is not None, 5))
+            c.shutdown()
+        self.assertEqual(stopped, [True], "dns-sd must not outlive the app")
+
+
 class DiagnosticsTest(unittest.TestCase):
     def test_report_has_what_we_need(self):
         c = app.Controller(sd=FakeSoundDevice(), prefs_file=Path(tempfile.mkdtemp()) / "p.json", scan=False)

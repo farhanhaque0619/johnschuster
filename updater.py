@@ -18,7 +18,10 @@ import tempfile
 from pathlib import Path
 
 REPO = "farhanhaque0619/johnschuster"
-RELEASE_API = f"https://api.github.com/repos/{REPO}/releases/tags/app-latest"
+# Plain release downloads, not the GitHub API: the API allows 60 requests an
+# hour per address, which a school or office network shares between everyone.
+LATEST_JSON = f"https://github.com/{REPO}/releases/download/app-latest/latest.json"
+DMG_URL = f"https://github.com/{REPO}/releases/download/app-latest/SyncAudio.dmg"
 APP = "SyncAudio.app"
 
 
@@ -39,15 +42,12 @@ def _run(cmd: list, timeout: float = 120) -> str:
 def latest_release() -> dict | None:
     """{"version", "commit", "dmg_url"} of the newest build, or None."""
     try:
-        data = json.loads(_run(["curl", "-fsSL", "--max-time", "15", "-H", "Accept: application/vnd.github+json",
-                                RELEASE_API], timeout=20))
+        data = json.loads(_run(["curl", "-fsSL", "--max-time", "15", LATEST_JSON], timeout=20))
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
         return None
-    dmg = next((a["browser_download_url"] for a in data.get("assets", []) if a.get("name") == "SyncAudio.dmg"), None)
-    if not dmg:
+    if not data.get("commit"):
         return None
-    return {"version": (data.get("name") or "").split()[-1] if data.get("name") else None,
-            "commit": data.get("target_commitish"), "dmg_url": dmg}
+    return {"version": data.get("version"), "commit": data["commit"], "dmg_url": DMG_URL}
 
 
 def current_bundle() -> Path | None:

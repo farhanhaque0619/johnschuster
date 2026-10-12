@@ -89,6 +89,7 @@ class Controller:
         self.history: deque = deque(maxlen=180)     # one sample a second, for diagnostics
         self.scan_errors: dict = {}
         self.probe_result = None
+        self.browser = None
         self.lock = threading.RLock()
         self.running = True
         self._recover_sound_output()
@@ -148,16 +149,17 @@ class Controller:
     def _scan_loop(self):
         """While idle: ask the network who's sharing (broadcast, a chunk of the
         subnet, remembered addresses) and listen to Bonjour, AirDrop link included."""
-        browser, sweep, sweep_ip = None, None, None
+        sweep, sweep_ip = None, None
         while self.running:
             if self.session is not None:
-                if browser:             # the AirDrop link costs Wi-Fi latency; not while playing
-                    browser.stop()
-                    browser = None
+                if self.browser:        # the AirDrop link costs Wi-Fi latency; not while playing
+                    self.browser.stop()
+                    self.browser = None
                 time.sleep(1.0)
                 continue
-            if browser is None:
-                browser = discovery.Browser().start()
+            if self.browser is None:
+                self.browser = discovery.Browser().start()
+            browser = self.browser
             ip = sa.lan_ip()
             if ip != sweep_ip:
                 sweep_ip, sweep, broadcast = ip, None, None
@@ -179,8 +181,6 @@ class Controller:
             if self.session is None:
                 self.nearby = [{"address": a, "name": n} for n, a in sorted(by_name.items(), key=lambda i: i[0].lower())]
             time.sleep(1.0)
-        if browser:
-            browser.stop()
 
     def _remember(self, addresses):
         """Macs we've played with: looked for directly next time."""
@@ -400,6 +400,9 @@ class Controller:
 
     def shutdown(self):
         self.running = False
+        if self.browser:            # its dns-sd would outlive the app otherwise
+            self.browser.stop()
+            self.browser = None
         with self.lock:
             self._stop_session()
 

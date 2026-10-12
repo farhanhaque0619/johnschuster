@@ -204,11 +204,9 @@ class UpdaterTest(unittest.TestCase):
         self.assertEqual((old / "Contents" / "version").read_text(), "1")
 
     def test_reads_the_latest_release(self):
-        release = {"name": "SyncAudio 1.0.9", "target_commitish": "abc123",
-                   "assets": [{"name": "SyncAudio.dmg", "browser_download_url": "https://example.com/SyncAudio.dmg"}]}
-        with mock.patch.object(updater, "_run", return_value=json.dumps(release)):
+        with mock.patch.object(updater, "_run", return_value=json.dumps({"version": "1.0.9", "commit": "abc123"})):
             self.assertEqual(updater.latest_release(),
-                             {"version": "1.0.9", "commit": "abc123", "dmg_url": "https://example.com/SyncAudio.dmg"})
+                             {"version": "1.0.9", "commit": "abc123", "dmg_url": updater.DMG_URL})
         with mock.patch.object(updater, "_run", side_effect=RuntimeError("offline")):
             self.assertIsNone(updater.latest_release())
 
