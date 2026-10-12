@@ -495,6 +495,7 @@ class SoundDeviceOutput:
         self.channels = min(2, info["max_output_channels"])
         self.underflows = 0         # macOS ran out of audio to play: a click
         clock = StreamClock(now)
+        good = []                   # the last sensible lead time
         failed = []
 
         def callback(outdata, frames, t, status):
@@ -503,8 +504,10 @@ class SoundDeviceOutput:
             try:
                 offset = clock.offset(t.currentTime)
                 lead = t.outputBufferDacTime - t.currentTime
-                if not 0.0 <= lead < 1.0:          # timestamps unavailable
-                    lead = self.stream.latency
+                if 0.0 <= lead < 1.0:
+                    good[:] = [lead]
+                else:                              # timestamps unavailable: don't jump
+                    lead = good[0] if good else self.stream.latency
                 outdata[:] = render(frames, t.currentTime + offset + lead, self.channels)
             except Exception as e:  # never let an exception kill the stream
                 outdata.fill(0)

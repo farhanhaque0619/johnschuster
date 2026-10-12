@@ -419,14 +419,17 @@ class FakeSoundDevice:
                 dac0, k = time.monotonic() + 0.05, 0
                 while not self.stop_event.is_set():
                     dac = dac0 + k * self.frames / self.rate
-                    time.sleep(max(0.0, dac - self.lead - time.monotonic()))
+                    asked = dac - self.lead             # when macOS asks for this buffer
+                    time.sleep(max(0.0, asked - time.monotonic()))
                     out = np.zeros((self.frames, self.channels), np.float32)
                     reported = dac + self.rng.uniform(-self.jitter, self.jitter)
                     t = types.SimpleNamespace(currentTime=time.monotonic() + epoch, outputBufferDacTime=reported + epoch)
                     if self.late and self.rng.random() > 0.1:
                         # PortAudio stamped the buffer on time; Python gets to it later, by an
                         # amount that wanders over seconds (now and then it's right on time).
-                        time.sleep(self.late * (0.5 + 0.5 * np.sin(k / 80)) * self.rng.uniform(0.6, 1.0))
+                        # Late relative to when it was asked for, so lateness never piles up.
+                        late = self.late * (0.5 + 0.5 * np.sin(k / 80)) * self.rng.uniform(0.6, 1.0)
+                        time.sleep(max(0.0, asked + late - time.monotonic()))
                     self.callback(out, self.frames, t, None)
                     self.written.append(out)
                     self.dacs.append(dac)
@@ -588,7 +591,7 @@ class BluetoothAudioTest(unittest.TestCase):
             host.stop()
 
     def test_busy_mac_on_airpods_plays_without_jumps(self):
-        """Saifan's Mac: Python handles each AirPods buffer late, by 0-18 ms and
+        """Saifan's Mac: Python handles each AirPods buffer late, by 0-30 ms and
         wandering. Timing buffers by when Python got to them made his player
         slide 4-5 ms a second and jump back every few seconds: the static."""
         port = free_port()
@@ -600,12 +603,27 @@ class BluetoothAudioTest(unittest.TestCase):
         join = sa.JoinSession(sd, "127.0.0.1", "Saifan", output_query="Saifan", port=port, log=self.quiet).start()
         try:
             self.assertTrue(wait_until(lambda: join.info()["state"] == "in_sync", 20), join.info())
-            time.sleep(2)
+            # Auto delay first grows to cover the AirPods; each raise is one deliberate jump.
+            settled = time.monotonic() + 30
+            delay, since = None, time.monotonic()
+            while time.monotonic() < settled and time.monotonic() - since < 7:
+                if join.info()["delay_ms"] != delay:
+                    delay, since = join.info()["delay_ms"], time.monotonic()
+                time.sleep(0.2)
             resyncs = join.client.player.resyncs
-            errors = []
-            steady = self.watch(lambda: (errors.append(abs(join.client.player.err)), join.info()["state"])[1], seconds=8)
+            errors, delays = [], [join.info()["delay_ms"]]
+
+            def sample():
+                errors.append(abs(join.client.player.err))
+                info = join.info()
+                if info["delay_ms"] != delays[-1]:
+                    delays.append(info["delay_ms"])
+                return info["state"]
+            steady = self.watch(sample, seconds=8)
             print(f"\n  busy Mac on AirPods: worst timing error {max(errors) * 1000:.1f} ms")
-            self.assertEqual(join.client.player.resyncs, resyncs, f"no jumps once settled: {join.info()}")
+            raises = len(delays) - 1     # a delay change is one deliberate jump
+            self.assertLessEqual(join.client.player.resyncs - resyncs, raises,
+                                 f"no jumps once settled: {join.info()}, delays {delays}")
             self.assertLess(max(errors), 0.005, "Python's lateness doesn't reach the timing")
             self.assertGreaterEqual(steady, 0.95, f"status stays on In sync: {join.info()}")
         finally:
