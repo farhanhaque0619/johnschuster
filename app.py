@@ -18,6 +18,7 @@ import http.server
 import json
 import os
 import platform
+import re
 import secrets
 import subprocess
 import sys
@@ -46,6 +47,38 @@ LINKS = {   # the only places the UI may ask us to open
     "download": DOWNLOAD_URL,
     "blackhole": BLACKHOLE_PAGE,
 }
+
+
+FIREWALL = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+
+
+def parse_firewall(globalstate: str, blockall: str, app: str) -> dict:
+    """Read socketfilterfw's answers: is the macOS firewall keeping other Macs out?"""
+    g, b, a = globalstate.lower(), blockall.lower(), app.lower()
+    enabled = ("enabled" in g or re.search(r"state = [12]", g) is not None) and "disabled" not in g
+    block_all = bool(b.strip()) and "disabled" not in b and ("block all" in b or "enabled" in b)
+    if "not part of the firewall" in a or not a.strip():
+        app_state = "not_listed"
+    elif "block" in a:
+        app_state = "blocked"
+    elif "permit" in a or "allow" in a:
+        app_state = "allowed"
+    else:
+        app_state = "unknown"
+    return {"enabled": enabled, "block_all": block_all, "app": app_state,
+            "needs_fix": enabled and (block_all or app_state in ("blocked", "not_listed"))}
+
+
+def firewall_status(app_path: str) -> dict:
+    def ask(*args):
+        try:
+            done = subprocess.run([FIREWALL, *args], capture_output=True, text=True, timeout=5)
+            return (done.stdout + done.stderr).strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    raw = {"global": ask("--getglobalstate"), "block_all": ask("--getblockall"),
+           "app": ask("--getappblocked", app_path)}
+    return {**parse_firewall(raw["global"], raw["block_all"], raw["app"]), "app_path": app_path, "raw": raw}
 
 
 def resource_dir() -> Path:
@@ -83,6 +116,7 @@ class Controller:
         self.idle_since = time.monotonic()
         self.install = {"state": "idle", "message": ""}
         self.build = updater.build_info(resource_dir(), VERSION)
+        sa.APP_VERSION = self.build.get("version") or VERSION
         self.update_info = {"state": "idle", "available": False, "version": None, "message": ""}
         self.on_quit = None     # set by the window: closes the app
         self.events: deque = deque(maxlen=40)
@@ -90,6 +124,7 @@ class Controller:
         self.scan_errors: dict = {}
         self.probe_result = None
         self.browser = None
+        self._firewall, self._firewall_at = None, 0.0
         self.lock = threading.RLock()
         self.running = True
         self._recover_sound_output()
@@ -358,6 +393,32 @@ class Controller:
         except (OSError, subprocess.SubprocessError):
             pass
 
+    def firewall(self, fresh: bool = False):
+        """The macOS firewall's view of this app (cached; it's three subprocesses)."""
+        if sys.platform != "darwin" or not os.path.exists(FIREWALL):
+            return None
+        if fresh or self._firewall is None or time.monotonic() - self._firewall_at > 20:
+            self._firewall = firewall_status(str(updater.current_bundle() or sys.executable))
+            self._firewall_at = time.monotonic()
+        return self._firewall
+
+    def fix_firewall(self):
+        """Let other Macs connect: add SyncAudio to the firewall as allowed (asks for the password)."""
+        fw = self.firewall(fresh=True)
+        if not fw or not fw["needs_fix"]:
+            return
+        path = fw["app_path"].replace("\\", "\\\\").replace('"', '\\"')
+        extra = f' & "; {FIREWALL} --setblockall off"' if fw["block_all"] else ""
+        done = subprocess.run(
+            ["osascript", "-e", f'set p to "{path}"', "-e",
+             f'do shell script "{FIREWALL} --add " & quoted form of p & "; {FIREWALL} --unblockapp " & '
+             f'quoted form of p{extra} with administrator privileges with prompt '
+             '"SyncAudio wants to let your other Macs connect to it through the macOS firewall."'],
+            capture_output=True, text=True)
+        if done.returncode != 0 and "-128" not in done.stderr:
+            self._log(f"! couldn't change the firewall: {done.stderr.strip()}")
+        self.firewall(fresh=True)
+
     def test_connection(self, address: str):
         address = (address or "").strip()
         if not address:
@@ -384,6 +445,7 @@ class Controller:
         report = {
             "app": self.build, "macos": platform.mac_ver()[0], "machine": platform.machine(),
             "network": {"ip": ip, "subnet": str(iface[0]) if iface else None, "firewall": firewall,
+                        "firewall_app": self.firewall(),
                         "scan_send_errors": self.scan_errors, "known_hosts": self.prefs.get("known_hosts", []),
                         "nearby": self.nearby, "bonjour": bool(discovery.dns_sd())},
             "devices": devices,
@@ -451,6 +513,7 @@ class Controller:
                          "delay_ms": self.prefs.get("delay_ms"), "play_local": self.prefs.get("play_local", True)},
             "events": list(self.events)[-6:],
             "probe": self.probe_result,
+            "firewall": self.firewall() if info and info["mode"] == "hosting" else None,
             "scan_blocked": self.scan_errors.get(65, 0) > 0,     # EHOSTUNREACH: Local Network permission
         }
 
@@ -518,6 +581,7 @@ def make_server(controller: Controller, port: int = 0) -> http.server.ThreadingH
                 "/api/check-update": controller.check_update,
                 "/api/test-connection": lambda: controller.test_connection(str(data.get("address", ""))),
                 "/api/copy-diagnostics": controller.copy_diagnostics,
+                "/api/fix-firewall": controller.fix_firewall,
                 "/api/install-update": controller.install_update,
             }
             action = actions.get(self.path)
@@ -574,10 +638,14 @@ def main(argv=None):
     ap.add_argument("--no-relaunch", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--probe", metavar="ADDRESS", help="test the connection to a sharing Mac")
     ap.add_argument("--port", type=int, default=sa.PORT, help=argparse.SUPPRESS)
+    ap.add_argument("--firewall-status", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--cli", nargs=argparse.REMAINDER, help="run the Terminal version (e.g. --cli host --click)")
     args, _ = ap.parse_known_args(argv)     # Finder may add its own arguments
     if args.cli is not None:
         return sa.main(args.cli)
+    if args.firewall_status:    # used by the build to check how macOS answers
+        print(json.dumps(firewall_status(str(updater.current_bundle() or sys.executable))))
+        return
     if args.probe:
         result = sa.probe(args.probe, args.port)
         print(json.dumps(result, indent=1))

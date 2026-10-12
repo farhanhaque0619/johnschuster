@@ -104,13 +104,46 @@ jobs:
           /tmp/apps/SyncAudio.app/Contents/MacOS/SyncAudio --self-test
           test -z "$(ls -A /tmp/apps | grep -v '^SyncAudio.app$')"   # staging cleaned up
 
+      - name: Install with the one-line installer, fresh and over an existing copy
+        run: |
+          mkdir -p /tmp/inst
+          for round in fresh update; do
+            SYNCAUDIO_DMG="$PWD/SyncAudio.dmg" SYNCAUDIO_DEST=/tmp/inst SYNCAUDIO_NO_OPEN=1 bash packaging/install.sh
+            /tmp/inst/SyncAudio.app/Contents/MacOS/SyncAudio --self-test
+          done
+          # For the record: does hdiutil create a missing -mountpoint folder? (the first hand-written command assumed so)
+          hdiutil attach -nobrowse -quiet -mountpoint /tmp/no-such-folder SyncAudio.dmg && echo "missing mountpoint: created" \
+            && hdiutil detach -quiet /tmp/no-such-folder || echo "missing mountpoint: hdiutil fails"
+
+      - name: How the macOS firewall answers, and whether the app reads it right
+        run: |
+          FW=/usr/libexec/ApplicationFirewall/socketfilterfw
+          APPX="$PWD/dist/SyncAudio.app"
+          check() {  # $1 = expected needs_fix (true/false), $2 = expected app state
+            out=$(dist/SyncAudio.app/Contents/MacOS/SyncAudio --firewall-status); echo "$out"
+            python -c "import json,sys; s=json.loads(sys.argv[1]); assert (s['needs_fix'], s['app']) == ($1, '$2'), s" "$out"
+          }
+          sudo $FW --setglobalstate on
+          check True not_listed
+          sudo $FW --add "$APPX" && sudo $FW --blockapp "$APPX"
+          check True blocked
+          sudo $FW --unblockapp "$APPX"
+          check False allowed
+          sudo $FW --setblockall on && $FW --getblockall
+          check True allowed
+          sudo $FW --setblockall off
+          sudo $FW --setglobalstate off
+          check False allowed
+
       - name: Ask GitHub for the latest build, like the app does
         run: dist/SyncAudio.app/Contents/MacOS/SyncAudio --check-update
 
       - uses: actions/upload-artifact@v4
         with:
           name: SyncAudio
-          path: SyncAudio.dmg
+          path: |
+            SyncAudio.dmg
+            packaging/install.sh
 
   release:
     needs: build          # only publish when both Macs built and passed every check
@@ -126,7 +159,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          ls -la dmgs/*.dmg
+          find dmgs -type f
+          [ -f dmgs/install.sh ] || mv dmgs/packaging/install.sh dmgs/install.sh
+          ls -la dmgs/*.dmg dmgs/install.sh
           cat > notes.md <<'NOTES'
           ## Download
 
@@ -148,7 +183,7 @@ jobs:
           # What the app's updater reads (a plain download, not the rate-limited GitHub API).
           printf '{"version": "1.0.%s", "commit": "%s"}\n' "$GITHUB_RUN_NUMBER" "$GITHUB_SHA" > dmgs/latest.json
           gh release delete app-latest --repo "$REPO" --yes --cleanup-tag || true
-          gh release create app-latest dmgs/*.dmg dmgs/latest.json --repo "$REPO" --target "$GITHUB_SHA" --latest \
+          gh release create app-latest dmgs/*.dmg dmgs/install.sh dmgs/latest.json --repo "$REPO" --target "$GITHUB_SHA" --latest \
             --title "SyncAudio 1.0.${{ github.run_number }}" --notes-file notes.md
 
       - name: Check the app's update check sees this build

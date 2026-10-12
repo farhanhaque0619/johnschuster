@@ -230,3 +230,31 @@ class UpdaterTest(unittest.TestCase):
         c.update_info.update(dmg_url="https://example.com/SyncAudio.dmg")
         c._install_update()
         self.assertEqual(c.update_info["state"], "failed")
+
+
+class FirewallTest(unittest.TestCase):
+    def test_reads_the_firewall(self):
+        on, off = "Firewall is enabled. (State = 1)", "Firewall is disabled. (State = 0)"
+        self.assertFalse(app.parse_firewall(off, "", "")["needs_fix"])
+        self.assertTrue(app.parse_firewall(on, "", "The application is not part of the firewall")["needs_fix"])
+        blocked = app.parse_firewall(on, "", "Incoming connection to the application is blocked")
+        self.assertEqual((blocked["app"], blocked["needs_fix"]), ("blocked", True))
+        allowed = app.parse_firewall(on, "", "Incoming connection to the application is permitted")
+        self.assertEqual((allowed["app"], allowed["needs_fix"]), ("allowed", False))
+        self.assertTrue(app.parse_firewall(on, "Firewall is set to block all non-essential incoming connections",
+                                           "Incoming connection to the application is permitted")["needs_fix"])
+
+    def test_fix_asks_for_the_password_once(self):
+        c = app.Controller(sd=FakeSoundDevice(), prefs_file=Path(tempfile.mkdtemp()) / "p.json", scan=False)
+        status = {**app.parse_firewall("Firewall is enabled. (State = 1)", "Firewall is set to block all",
+                                       "is blocked"), "app_path": "/Applications/Sync Audio's.app"}
+        calls = []
+        with mock.patch.object(c, "firewall", return_value=status), \
+                mock.patch.object(app.subprocess, "run",
+                                  lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", "")):
+            c.fix_firewall()
+        self.assertEqual(len(calls), 1)
+        script = " ".join(calls[0])
+        self.assertIn("with administrator privileges", script)
+        for part in ("--add", "--unblockapp", "--setblockall off", "set p to \"/Applications/Sync Audio's.app\""):
+            self.assertIn(part, script)

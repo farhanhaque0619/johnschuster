@@ -208,13 +208,18 @@
       <div class="meter" aria-label="Input level"><div id="meter"></div></div>
       <p class="muted" id="host-hint"></p>
       <div class="help" id="host-silent" hidden>
-        <b>Playing something but the bar isn't moving?</b>
+        <b>Nothing is coming through, so everyone hears silence.</b> If something is playing:
         <ul>
           <li>Allow SyncAudio to use the microphone. It only listens to BlackHole, never your real mic.
             <button class="link" data-open="microphone">Open Microphone settings</button></li>
           <li>Check the Mac's sound output is <b>BlackHole 2ch</b>.
             <button class="link" data-open="sound">Open Sound settings</button></li>
         </ul>
+      </div>
+      <div class="help" id="firewall-warn" hidden>
+        <b>The macOS Firewall is blocking SyncAudio</b>, so other Macs can't join this one.
+        <div style="margin-top:8px"><button class="primary" data-action="fix-firewall">Allow SyncAudio</button>
+        <span class="muted small">Asks for your Mac password.</span></div>
       </div>
       <button id="btn-click">Play test clicks</button>
     </div>
@@ -254,6 +259,7 @@
         <div><b id="st-delay">–</b><label>Audio delay</label></div>
         <div><b id="st-drop">0</b><label>Dropouts</label></div>
       </div>
+      <div class="help" id="listen-version" style="margin-bottom:0" hidden></div>
     </div>
   </section>
 
@@ -428,8 +434,9 @@ function renderHosting(s) {
   else if (h.silent_s < 2) hint = "Sharing everything this Mac plays.";
   else hint = "Play something on this Mac (Spotify, YouTube, anything).";
   $("host-hint").textContent = hint;
-  show($("host-silent"), !h.click && h.silent_s > 20);
+  show($("host-silent"), !h.click && (h.silent_s > 20 || (h.silent_s > 6 && h.listeners.length > 0)));
   $("btn-click").textContent = h.click ? "Back to this Mac's audio" : "Play test clicks";
+  show($("firewall-warn"), !!(s.firewall && s.firewall.needs_fix));
 
   let rows = "";
   if (h.local) rows += speakerRow("This Mac", h.local.state, (STATE_TEXT[h.local.state] || "") + (h.output ? " · " + h.output : ""));
@@ -437,6 +444,7 @@ function renderHosting(s) {
     let detail = STATE_TEXT[l.state] || "Connecting…";
     if (l.wifi_ms != null) detail += ` · Wi-Fi ${ms(l.wifi_ms)}`;
     if (l.dropouts) detail += ` · ${l.dropouts} dropout${l.dropouts === 1 ? "" : "s"}`;
+    if (l.version !== s.app.version) detail += l.version ? ` · has SyncAudio ${l.version}` : " · older SyncAudio, needs updating";
     rows += speakerRow(l.name, l.state, detail);
   }
   setHTML($("speakers"), rows);
@@ -473,9 +481,19 @@ function renderListening(s) {
     title = "Connecting to " + host + "…";
   }
   if (c.error) detail = c.error;
+  if (c.connection === "connected" && c.state === "in_sync" && c.incoming_silent_s > 6) {
+    dot = "waiting"; title = "Connected, but there's no sound";
+    detail = `${host} is sending silence. On that Mac: play something, check the bar under "Sharing this Mac" moves, `
+      + `and if it doesn't, turn on SyncAudio in System Settings → Privacy & Security → Microphone, then stop and start sharing.`;
+  }
   $("listen-dot").className = "dot " + dot;
   $("listen-status").textContent = title;
   $("listen-detail").textContent = detail;
+  const hv = c.host_version, mine = s.app.version;
+  show($("listen-version"), c.connection === "connected" && hv !== mine);
+  $("listen-version").innerHTML = hv
+    ? `<b>Different versions.</b> ${esc(host)} has SyncAudio ${esc(hv)}, this Mac has ${esc(mine)}. Update the older one so both match (Settings → Check for updates).`
+    : `<b>${esc(host)} has an older SyncAudio.</b> It can't keep AirPods and other headphones fed, so you may hear nothing. Update SyncAudio on that Mac.`;
   $("st-wifi").textContent = ms(c.wifi_ms);
   $("st-delay").textContent = ms(c.delay_ms);
   $("st-drop").textContent = c.dropouts ?? 0;

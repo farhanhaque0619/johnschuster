@@ -590,6 +590,34 @@ class AirPodsTest(unittest.TestCase):
         self.assertEqual(state["output"], self.AIRPODS["name"], "stopping hands the sound back to the AirPods")
 
 
+class CombinedDeviceTest(unittest.TestCase):
+    """People make a "Multi-Output Device" (often BlackHole + speakers) from BlackHole guides."""
+
+    MULTI = {"name": "Multi-Output Device", "max_input_channels": 0, "max_output_channels": 2,
+             "default_samplerate": 48000.0}
+
+    def test_sharing_mac_puts_the_output_back_on_blackhole(self):
+        sd, state = FakeSoundDevice(), {"output": "MacBook Pro Speakers"}
+        sd.DEVICES = sd.DEVICES + [self.MULTI]
+        with AirPodsTest.fake_switch_tool(state):
+            host = sa.HostSession(sd, "Den", port=free_port(), switch_tool="SwitchAudioSource",
+                                  log=lambda *a: None).start()
+            try:
+                state["output"] = "Multi-Output Device"         # picked in Control Center
+                self.assertTrue(wait_until(lambda: state["output"] == "BlackHole 2ch", 6), state)
+                self.assertEqual(host.output.name, "MacBook Pro Speakers", "never plays into it: echo")
+                self.assertEqual(host.system.previous, "MacBook Pro Speakers")
+            finally:
+                host.stop()
+        self.assertEqual(state["output"], "MacBook Pro Speakers")
+
+    def test_never_picked_for_playback(self):
+        sd = FakeSoundDevice()
+        sd.DEVICES = sd.DEVICES + [self.MULTI]
+        sd.default.device = [0, len(sd.DEVICES) - 1]
+        self.assertEqual(sd.DEVICES[sa.pick_output(sd, None)]["name"], "MacBook Pro Speakers")
+
+
 class GroupVolumeTest(unittest.TestCase):
     def test_changes_glide_over_one_block(self):
         host = sa.Host(RATE, 1, 0.1, free_port(), log=lambda *a: None)

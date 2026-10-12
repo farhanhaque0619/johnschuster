@@ -30,8 +30,12 @@ SyncAudio updates itself. When a new version is out, a banner with **Update now*
 appears. Click it and the app restarts as the new version a few seconds later.
 macOS may ask for the microphone and local-network permissions again; click **Allow**.
 
-(Versions from before the updater existed need one manual update: quit SyncAudio,
-then download and drag in the new `.dmg` as above, choosing **Replace**.)
+**Installing or updating from Terminal** (handy for older versions without the
+updater, and it skips the "can't verify" prompt):
+
+```bash
+curl -fsSL https://github.com/farhanhaque0619/johnschuster/releases/latest/download/install.sh | bash
+```
 
 ## Use it
 
@@ -89,8 +93,13 @@ going, so everyone else still hears it.
 * **"Can't reach …" when joining.** The app says why underneath: wrong address,
   the network keeping devices apart, the Mac not sharing, or macOS blocking
   local-network access.
-* **The bar doesn't move while music plays.** Turn on SyncAudio in **System Settings →
-  Privacy & Security → Microphone**, then stop and start sharing.
+* **The bar doesn't move while music plays** (listeners hear silence; their app says
+  so). The sharing Mac's sound output must be **BlackHole 2ch**, not "Multi-Output
+  Device" or anything else. SyncAudio sets this itself and puts it back if it changes.
+  Also turn on SyncAudio in **System Settings → Privacy & Security → Microphone**
+  (macOS may ask again after an update), then stop and start sharing.
+* **Others can't join you, but you can join them.** Your Mac's firewall is probably
+  blocking SyncAudio. The sharing screen shows **Allow SyncAudio** when that's the case.
 * **Audio drops out.** With delay on Auto, SyncAudio raises the delay within a few
   seconds. If it keeps happening, move closer to the router or use 5 GHz Wi-Fi.
   Macs also briefly pause Wi-Fi to scan for AirDrop. Running

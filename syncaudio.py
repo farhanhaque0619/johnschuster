@@ -40,6 +40,7 @@ PORT = 47800                # TCP carries audio, UDP (same number) clock sync + 
 MAGIC = "syncaudio/1"
 BLOCK_MS = 5                # capture block size
 OUTPUT_LATENCY = 0.04       # requested CoreAudio output buffer; compensated, so it only costs headroom
+APP_VERSION = "dev"         # the app sets its build version; exchanged so Macs can spot mismatches
 
 # --------------------------------------------------------------------- wire
 HELLO, HEADER, AUDIO, STATS, UPDATE, CONTROL = b"H", b"C", b"A", b"S", b"U", b"K"
@@ -186,6 +187,7 @@ class Player:
             self.dropouts = 0
             self.resyncs = 0
             self.margins: deque = deque(maxlen=200)    # spare audio after each callback, seconds
+            self.last_sound = None                      # when a block with actual sound last arrived
             self._dac = None
             self._dac_frames = 0
 
@@ -200,6 +202,8 @@ class Player:
             self._write(n, pcm)
             self.n_end = n + k
             self.anchor = (n, play_at)
+            if k and float(np.abs(pcm).max()) > 1e-4:
+                self.last_sound = time.monotonic()
 
     def _write(self, n: int, pcm: np.ndarray) -> None:
         i, k = n % self.cap, len(pcm)
@@ -289,6 +293,12 @@ class Player:
     @property
     def in_sync(self) -> bool:
         return self.read_n is not None and self.synced
+
+    def silent_for(self):
+        """Seconds since any sound arrived (None before anything arrived)."""
+        if self.n_end is None:
+            return None
+        return time.monotonic() - self.last_sound if self.last_sound else float("inf")
 
     def headroom(self):
         """How much audio was left over at the tightest recent moment, in
@@ -408,6 +418,13 @@ def find_device(sd, query: str, kind: str) -> int:
     raise SetupError("no_device", f'No {kind} device matching "{query}". Available: {names}')
 
 
+def is_combined(name: str) -> bool:
+    """Multi-Output / Aggregate devices people make for BlackHole often contain
+    BlackHole itself: playing into one would feed the share back into itself."""
+    name = name.lower()
+    return "blackhole" in name or "multi-output" in name or "aggregate" in name
+
+
 def pick_output(sd, query: str | None) -> int:
     """The named device, else the current default output (unless that is
     BlackHole), else the built-in speakers."""
@@ -415,10 +432,10 @@ def pick_output(sd, query: str | None) -> int:
         return find_device(sd, query, "output")
     devices = sd.query_devices()
     default = sd.default.device[1]
-    if default is not None and 0 <= default < len(devices) and "blackhole" not in devices[default]["name"].lower():
+    if default is not None and 0 <= default < len(devices) and not is_combined(devices[default]["name"]):
         return default
     outputs = [i for i, d in enumerate(devices)
-               if d["max_output_channels"] > 0 and "blackhole" not in d["name"].lower()]
+               if d["max_output_channels"] > 0 and not is_combined(d["name"])]
     speakers = [i for i in outputs if "speaker" in devices[i]["name"].lower()]
     if speakers or outputs:
         return (speakers or outputs)[0]
@@ -490,6 +507,7 @@ class _Peer:
         self.sock, self.name, self.ip = sock, name, ip
         self.q: queue.Queue = queue.Queue(maxsize=self.QUEUE)
         self.stats: dict = {}
+        self.version = None
         self.joined = time.monotonic()
         self.alive = True
 
@@ -603,7 +621,7 @@ class Host:
     def listeners(self) -> list:
         with self.lock:
             peers = sorted((p for p in self.peers if not getattr(p, "probe", False)), key=lambda p: p.name.lower())
-        return [{"state": "waiting", **p.stats, "name": p.name, "ip": p.ip,
+        return [{"state": "waiting", **p.stats, "name": p.name, "ip": p.ip, "version": p.version,
                  "connected_s": time.monotonic() - p.joined}
                 for p in peers]
 
@@ -642,9 +660,10 @@ class Host:
                 return
             sock.sendall(frame(HEADER, json.dumps({
                 "rate": self.rate, "channels": self.channels, "delay": self.delay,
-                "group_volume": self.group_volume, "name": self.name}).encode()))
+                "group_volume": self.group_volume, "name": self.name, "version": APP_VERSION}).encode()))
             peer = _Peer(sock, str(hello.get("name") or ip)[:40], ip)
             peer.probe = bool(hello.get("probe"))
+            peer.version = hello.get("version")
             with self.lock:
                 self.peers.add(peer)
             if not peer.probe:
@@ -862,6 +881,7 @@ class Client:
         self.player: Player | None = None
         self.output = None
         self.host_name = None
+        self.host_version = None
         self.delay = None
         self.group_volume = None
         self.group_volume_by = None
@@ -933,11 +953,13 @@ class Client:
         stop = threading.Event()
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.sendall(frame(HELLO, json.dumps({"magic": MAGIC, "name": self.name}).encode()))
+            sock.sendall(frame(HELLO, json.dumps({"magic": MAGIC, "name": self.name,
+                                                  "version": APP_VERSION}).encode()))
             kind, payload = recv_frame(sock)
             if kind != HEADER:
                 raise ConnectionError("not a syncaudio host")
             hdr = json.loads(payload)
+            self.host_version = hdr.get("version")      # None: a version from before versions were sent
             rate, channels = int(hdr["rate"]), int(hdr["channels"])
             self.host_name = hdr.get("name", ip)
             self.delay = float(hdr.get("delay", 0))
@@ -1070,7 +1092,7 @@ class SystemOutput:
                      "so apps play into SyncAudio.")
             return
         current = self.current()
-        self.previous = fallback if "blackhole" in current.lower() else current
+        self.previous = fallback if is_combined(current) else current
         if current != name:
             self._run("-s", name)
             self.log(f'Sound output switched to "{name}" (restored when you stop).')
@@ -1178,14 +1200,16 @@ class HostSession:
             return
         current = self.system.current()
         changed, self._seen_output = current != getattr(self, "_seen_output", None), current
-        if not current or "blackhole" in current.lower() or not changed:
+        if not current or current.lower().startswith("blackhole") or not changed:
             return
-        if self.output and not self.output_query and current != self.output.name:
+        if self.output and not self.output_query and current != self.output.name and not is_combined(current):
             self._reopen_audio(current)
             self.log(f'This Mac now plays on "{current}".')
         if not self.click and self.switch_output and isinstance(self.source, SoundDeviceInput):
-            self.system.previous = current
+            if not is_combined(current):
+                self.system.previous = current
             self.system.set(self.source.name)
+            self.log(f'Sound output was "{current}"; put back on "{self.source.name}" so everyone hears it.')
 
     def _reopen_audio(self, output_name: str):
         sd, h = self.sd, self.host
@@ -1309,7 +1333,7 @@ class JoinSession:
             return
         current = self.system.current()
         changed, self._seen_output = current != getattr(self, "_seen_output", self.output_name), current
-        if not current or not changed or current == self.output_name or "blackhole" in current.lower():
+        if not current or not changed or current == self.output_name or is_combined(current):
             return
         self.output_name = current
         self.client.reopen_output(before_open=lambda: refresh_portaudio(self.sd))
@@ -1323,11 +1347,13 @@ class JoinSession:
     def info(self) -> dict:
         c = self.client
         return {
-            "mode": "listening", "address": self.address, "host_name": c.host_name,
+            "mode": "listening", "address": self.address, "host_name": c.host_name, "host_version": c.host_version,
             "connection": c.phase, "output": self.output_name, "error": c.error, "problem": c.problem,
             "delay_ms": round(c.delay * 1000) if c.delay is not None else None,
             "group_volume": c.group_volume, "group_volume_by": c.group_volume_by,
             "clock": c.clock.estimate is not None, **c.stats(),
+            "incoming_silent_s": (lambda q: None if q is None else round(min(q, 9999), 1))(
+                c.player.silent_for() if c.player else None),
         }
 
 
