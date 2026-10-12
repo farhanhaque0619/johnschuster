@@ -44,11 +44,11 @@ jobs:
           echo "SWITCHAUDIO_BIN=$(realpath "$(brew --prefix)/bin/SwitchAudioSource")" >> "$GITHUB_ENV"
 
       - name: Build SyncAudio.app
-        env:
-          APP_VERSION: "1.0.${{ github.run_number }}"
         run: |
+          export APP_VERSION=$(python -c 'import app; print(app.VERSION)')
           # The updater compares this with the published build.
-          printf '{"version": "%s", "commit": "%s"}\n' "$APP_VERSION" "$GITHUB_SHA" > build_info.json
+          printf '{"version": "%s", "commit": "%s", "build": %s}\n' "$APP_VERSION" "$GITHUB_SHA" "$GITHUB_RUN_NUMBER" > build_info.json
+          cat build_info.json
           pyinstaller --noconfirm --clean packaging/SyncAudio.spec
 
       - name: Check the built app
@@ -144,6 +144,7 @@ jobs:
           path: |
             SyncAudio.dmg
             packaging/install.sh
+            build_info.json
 
   release:
     needs: build          # only publish when both Macs built and passed every check
@@ -165,7 +166,13 @@ jobs:
           cat > notes.md <<'NOTES'
           ## Download
 
-          **[SyncAudio.dmg](https://github.com/farhanhaque0619/johnschuster/releases/latest/download/SyncAudio.dmg)**:
+          **Install or update from Terminal** (both Macs):
+
+          ```
+          curl -fsSL https://github.com/farhanhaque0619/johnschuster/releases/latest/download/install.sh | bash
+          ```
+
+          Or download **[SyncAudio.dmg](https://github.com/farhanhaque0619/johnschuster/releases/latest/download/SyncAudio.dmg)**:
           for Macs with Apple silicon (M1 or newer) running macOS 14 Sonoma or later.
 
           ## Install
@@ -181,17 +188,21 @@ jobs:
           NOTES
           sed -i 's/^          //' notes.md
           # What the app's updater reads (a plain download, not the rate-limited GitHub API).
-          printf '{"version": "1.0.%s", "commit": "%s"}\n' "$GITHUB_RUN_NUMBER" "$GITHUB_SHA" > dmgs/latest.json
+          cp dmgs/build_info.json dmgs/latest.json
+          version=$(python3 -c 'import json; print(json.load(open("dmgs/latest.json"))["version"])')
           gh release delete app-latest --repo "$REPO" --yes --cleanup-tag || true
           gh release create app-latest dmgs/*.dmg dmgs/install.sh dmgs/latest.json --repo "$REPO" --target "$GITHUB_SHA" --latest \
-            --title "SyncAudio 1.0.${{ github.run_number }}" --notes-file notes.md
+            --title "SyncAudio $version" --notes-file notes.md
 
       - name: Check the app's update check sees this build
         env:
           REPO: ${{ github.repository }}
         run: |
           for i in 1 2 3 4 5 6; do
-            curl -fsSL "https://github.com/$REPO/releases/download/app-latest/latest.json" | tee /dev/stderr | grep -q "$GITHUB_SHA" && exit 0
+            if curl -fsSL "https://github.com/$REPO/releases/download/app-latest/latest.json" | tee /dev/stderr | grep -q "$GITHUB_SHA" \
+               && curl -fsSL "https://github.com/$REPO/releases/latest/download/install.sh" | grep -q "SyncAudio"; then
+              exit 0
+            fi
             sleep 10
           done
           exit 1

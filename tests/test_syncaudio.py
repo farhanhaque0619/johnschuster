@@ -434,14 +434,14 @@ class AutoDelayTest(unittest.TestCase):
         auto = sa.AutoDelay()
         self.assertIsNone(auto.update(10, {"a": {"headroom_ms": 60, "dropouts": 0}}))
         new = auto.update(11, {"a": {"headroom_ms": -219, "dropouts": 3}, "b": {"headroom_ms": 80, "dropouts": 0}})
-        self.assertAlmostEqual(new, 0.42)      # 150 ms + 219 ms late + 50 ms margin, rounded up
+        self.assertAlmostEqual(new, 0.52)      # 250 ms + 219 ms late + 50 ms margin, rounded up
         # Listeners need a few seconds to measure the new delay; old bad numbers are ignored.
         self.assertIsNone(auto.update(13, {"a": {"headroom_ms": -219, "dropouts": 5}}))
 
     def test_dropouts_alone_raise_the_delay(self):
         auto = sa.AutoDelay()
         auto.update(0, {"a": {"headroom_ms": 40, "dropouts": 0}})
-        self.assertAlmostEqual(auto.update(1, {"a": {"headroom_ms": 40, "dropouts": 1}}), 0.20)
+        self.assertAlmostEqual(auto.update(1, {"a": {"headroom_ms": 40, "dropouts": 1}}), 0.30)
 
     def test_lowers_slowly_after_a_long_calm(self):
         auto = sa.AutoDelay(0.4)

@@ -31,11 +31,12 @@ from collections import deque
 from pathlib import Path
 
 import discovery
+import room
 import syncaudio as sa
 import updater
 
 APP_NAME = "SyncAudio"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DOWNLOAD_URL = "https://github.com/farhanhaque0619/johnschuster/releases/latest"
 BLACKHOLE_URL = "https://existential.audio/downloads/BlackHole2ch-0.7.1.pkg"
 BLACKHOLE_SHA256 = "57b540f27a3e29c37e310e01bee0fdfab76733087e47f997ef9dccf851400dcf"
@@ -99,7 +100,7 @@ class Controller:
     """Owns the current session (sharing or listening) and everything the UI shows."""
 
     def __init__(self, sd=None, prefs_file: Path | None = None, port: int = sa.PORT, scan: bool = True,
-                 opener=None, switch_tool: str | None = None):
+                 opener=None, switch_tool: str | None = None, room_port: int | None = None):
         self._sd = sd
         self.prefs_file = Path(prefs_file or default_prefs_file())
         self.prefs = self._load_prefs()
@@ -126,8 +127,20 @@ class Controller:
         self.browser = None
         self._firewall, self._firewall_at = None, 0.0
         self.lock = threading.RLock()
+        self._prefs_lock = threading.Lock()
         self.running = True
         self._recover_sound_output()
+        self.device_id = self.prefs.get("device_id") or secrets.token_hex(8)
+        if self.prefs.get("device_id") != self.device_id:
+            self.prefs["device_id"] = self.device_id
+            self._save_prefs()
+        self.room = self.room_ad = self.room_browser = None
+        self.room_note = None           # result of the last Connect, for the UI
+        self.paused_at = None           # this Mac left the current round of music
+        if room_port is None and scan:
+            room_port = room.ROOM_PORT
+        if room_port:
+            self._start_room(room_port)
         if scan:
             threading.Thread(target=self._scan_loop, daemon=True).start()
             threading.Thread(target=self._update_loop, daemon=True).start()
@@ -152,11 +165,12 @@ class Controller:
     def _save_prefs(self):
         self.prefs.update(offset_ms=self.settings.offset_ms, volume=self.settings.volume,
                           channel=self.settings.channel)
-        try:
-            self.prefs_file.parent.mkdir(parents=True, exist_ok=True)
-            self.prefs_file.write_text(json.dumps(self.prefs, indent=2))
-        except OSError as e:
-            self._log(f"couldn't save settings: {e}")
+        with self._prefs_lock:
+            try:
+                self.prefs_file.parent.mkdir(parents=True, exist_ok=True)
+                self.prefs_file.write_text(json.dumps(self.prefs, indent=2))
+            except (OSError, RuntimeError, TypeError) as e:
+                self._log(f"couldn't save settings: {e}")
 
     def _log(self, msg: str):
         self.events.append({"t": time.time(), "msg": msg})
@@ -187,13 +201,16 @@ class Controller:
         sweep, sweep_ip = None, None
         while self.running:
             if self.session is not None:
-                if self.browser:        # the AirDrop link costs Wi-Fi latency; not while playing
-                    self.browser.stop()
-                    self.browser = None
+                for attr in ("browser", "room_browser"):    # the AirDrop link costs Wi-Fi latency
+                    if getattr(self, attr):
+                        getattr(self, attr).stop()
+                        setattr(self, attr, None)
                 time.sleep(1.0)
                 continue
             if self.browser is None:
                 self.browser = discovery.Browser().start()
+            if self.room and self.room_browser is None:
+                self.room_browser = discovery.Browser(service=discovery.ROOM_SERVICE).start()
             browser = self.browser
             ip = sa.lan_ip()
             if ip != sweep_ip:
@@ -202,19 +219,42 @@ class Controller:
                 if iface:
                     sweep, broadcast = discovery.Sweep(ip, iface[0]), iface[1]
             targets = {"255.255.255.255", *self.prefs.get("known_hosts", [])}
+            if self.room_browser:
+                targets.update(self.room_browser.found.values())
+            if self.room:
+                targets.update(m.get("ip") for m in self.room.members.values() if m.get("ip"))
             if sweep:
                 targets.update(sweep.next_targets())
                 targets.add(broadcast)
+            targets.discard(None)
+            # Macs with SyncAudio open (1.1+: can connect), asked in parallel with the sharing check.
+            agents = []
+            finder = threading.Thread(target=lambda: agents.extend(room.discover(targets, timeout=0.8)), daemon=True)
+            if self.room:
+                finder.start()
             by_name, errors = {}, []      # one entry per Mac, even when several routes found it
-            replies = sa.discover_all(self.port, timeout=1.0, targets=targets, errors=errors)
+            replies = sa.discover_all(self.port, timeout=0.8, targets=targets, errors=errors)
+            if self.room:
+                finder.join(2)
             self.scan_errors = dict(collections.Counter(errors))
             for address, name in replies:
                 if name not in by_name or by_name[name].startswith("127."):
                     by_name[name] = address
             for name, address in list(browser.found.items()):
                 by_name.setdefault(name, address)
+            nearby = {}
+            for agent in agents:
+                if agent["id"] == self.device_id:
+                    continue
+                self.room.saw(agent)
+                nearby[agent["name"]] = {"name": agent["name"], "address": agent["address"], "id": agent["id"],
+                                         "room_port": agent.get("room_port"), "sharing": bool(agent.get("sharing")),
+                                         "member": agent["id"] in self.room.members}
+            for name, address in by_name.items():      # sharing Macs, including older versions
+                nearby.setdefault(name, {"name": name, "address": address, "sharing": True})["sharing"] = True
             if self.session is None:
-                self.nearby = [{"address": a, "name": n} for n, a in sorted(by_name.items(), key=lambda i: i[0].lower())]
+                self.nearby = sorted((n for n in nearby.values() if not n.get("member")),
+                                     key=lambda n: n["name"].lower())
             time.sleep(1.0)
 
     def _remember(self, addresses):
@@ -264,6 +304,71 @@ class Controller:
         except Exception as e:
             self.update_info.update(state="failed", message=f"Couldn't update: {e}")
 
+    # --------------------------------------------------------------- rooms
+    def _start_room(self, port: int):
+        agent = room.RoomAgent(
+            me={"id": self.device_id, "name": self.name, "version": sa.APP_VERSION, "port": self.port},
+            store=self.prefs.setdefault("room", {}), save=self._save_prefs, log=self._log,
+            on_change=self._room_changed, port=port, my_ip=sa.lan_ip,
+            sharing=lambda: isinstance(self.session, sa.HostSession))
+        try:
+            self.room = agent.start()
+        except OSError as e:
+            self._log(f"! connecting Macs is off: port {port} is in use ({e}). Is SyncAudio open twice?")
+            return
+        self.room_ad = discovery.Advertiser(self.name, port, sa.lan_ip(), service=discovery.ROOM_SERVICE).start()
+
+    def _room_changed(self):
+        threading.Thread(target=self._apply_room, daemon=True).start()
+
+    def _apply_room(self):
+        """Make this Mac do what the room says: share, listen to someone, or stop."""
+        if not self.room or not self.running:
+            return
+        with self.lock:
+            src = dict(self.room.source)
+            sid, s = src["id"], self.session
+            from_room = getattr(s, "from_room", False)
+            if sid is None:
+                if s and from_room:
+                    self._stop_session()
+                return
+            if self.paused_at == src["at"]:         # this Mac left this round; wait for the next choice
+                return
+            if sid == self.device_id:
+                if isinstance(s, sa.HostSession):
+                    s.from_room = True
+                    return
+                if not self.share(from_room=True):
+                    threading.Thread(target=self.room.set_source, args=(None,), daemon=True).start()
+                return
+            member = self.room.members.get(sid)
+            if not member or not member.get("ip"):
+                return
+            port = member.get("port") or sa.PORT
+            if isinstance(s, sa.JoinSession) and s.address == member["ip"] and s.port == port:
+                s.from_room = True
+                return
+            self.join(member["ip"], port=port, from_room=True)
+
+    def play(self, sid: str | None):
+        """Whose music the room hears (None: nobody's)."""
+        if self.room:
+            self.paused_at = None
+            self.error = None
+            self.room.set_source(sid)
+
+    def connect(self, address: str, room_port: int | None = None):
+        if self.room and address:
+            result = self.room.request_connect(address.strip(), int(room_port or room.ROOM_PORT))
+            self.room_note = (f"Asked {result['name']} to connect. Click Accept on that Mac." if result["ok"]
+                              else result["message"])
+
+    def room_action(self, action: str, sid: str):
+        if not self.room:
+            return
+        {"accept": self.room.accept, "decline": self.room.decline, "forget": self.room.forget}[action](sid)
+
     # ------------------------------------------------------------- actions
     def _stop_session(self):
         if self.session:
@@ -280,8 +385,12 @@ class Controller:
             self.blackhole = False
         self._log(f"! {e}")
 
-    def share(self, click: bool = False):
+    def share(self, click: bool = False, from_room: bool = False) -> bool:
+        if not from_room and not click and self.room and self.room.members:
+            self.play(self.device_id)       # in a room, sharing means everyone switches to this Mac
+            return True
         with self.lock:
+            from_room = from_room or getattr(self.session, "from_room", False)
             self._stop_session()
             self.error = None
             try:
@@ -291,29 +400,43 @@ class Controller:
                                          port=self.port, switch_tool=self.switch_tool, log=self._log)
                 session.start()
             except Exception as e:
-                return self._fail(e)
+                self._fail(e)
+                return False
+            session.from_room = from_room
             self.session = session
             if session.system and session.system.previous:
                 self.prefs["restore_output"] = session.system.previous
                 self._save_prefs()
+            return True
 
-    def join(self, address: str):
+    def join(self, address: str, port: int | None = None, from_room: bool = False) -> bool:
         address = (address or "").strip()
         if not address:
-            return
+            return False
         with self.lock:
             self._stop_session()
             self.error = None
             try:
-                self.session = sa.JoinSession(self.sd, address, self.name, settings=self.settings,
-                                              port=self.port, switch_tool=self.switch_tool, log=self._log).start()
+                session = sa.JoinSession(self.sd, address, self.name, settings=self.settings,
+                                         port=port or self.port, switch_tool=self.switch_tool, log=self._log)
+                session.from_room = from_room
+                self.session = session.start()
             except Exception as e:
-                return self._fail(e)
-            self.prefs["last_host"] = address
-            self._save_prefs()
+                self._fail(e)
+                return False
+            if not from_room:
+                self.prefs["last_host"] = address
+                self._save_prefs()
+            return True
 
     def stop(self):
         with self.lock:
+            s = self.session
+            if getattr(s, "from_room", False) and self.room:
+                if isinstance(s, sa.HostSession):
+                    self.play(None)                         # the music's source stops it for everyone
+                    return
+                self.paused_at = self.room.source["at"]     # a listener just steps out
             self._stop_session()
             self.error = None
 
@@ -450,6 +573,7 @@ class Controller:
                         "nearby": self.nearby, "bonjour": bool(discovery.dns_sd())},
             "devices": devices,
             "session": self.session.info() if self.session else None,
+            "room": self.room.status() if self.room else None,
             "settings": self.state()["settings"],
             "history": list(self.history),
             "events": list(self.events),
@@ -462,6 +586,9 @@ class Controller:
 
     def shutdown(self):
         self.running = False
+        for thing in (self.room_browser, self.room_ad, self.room):
+            if thing:
+                thing.stop()
         if self.browser:            # its dns-sd would outlive the app otherwise
             self.browser.stop()
             self.browser = None
@@ -513,6 +640,10 @@ class Controller:
                          "delay_ms": self.prefs.get("delay_ms"), "play_local": self.prefs.get("play_local", True)},
             "events": list(self.events)[-6:],
             "probe": self.probe_result,
+            "device_id": self.device_id,
+            "room": {**self.room.status(), "note": self.room_note,
+                     "paused": self.paused_at is not None and self.paused_at == self.room.source["at"]}
+                    if self.room else None,
             "firewall": self.firewall() if info and info["mode"] == "hosting" else None,
             "scan_blocked": self.scan_errors.get(65, 0) > 0,     # EHOSTUNREACH: Local Network permission
         }
@@ -571,6 +702,9 @@ def make_server(controller: Controller, port: int = 0) -> http.server.ThreadingH
             actions = {
                 "/api/share": lambda: controller.share(bool(data.get("click"))),
                 "/api/join": lambda: controller.join(str(data.get("address", ""))),
+                "/api/play": lambda: controller.play(data.get("id")),
+                "/api/connect": lambda: controller.connect(str(data.get("address", "")), data.get("room_port")),
+                "/api/room": lambda: controller.room_action(str(data.get("action")), str(data.get("id"))),
                 "/api/stop": controller.stop,
                 "/api/settings": lambda: controller.update(data),
                 "/api/install-blackhole": controller.install_blackhole,
@@ -663,6 +797,7 @@ def main(argv=None):
         print("update staged; swapping after exit")
         return
 
+    sys.setswitchinterval(0.001)    # hand Python to the audio threads sooner: fewer clicks
     controller = Controller()
     server = make_server(controller)
     threading.Thread(target=server.serve_forever, daemon=True).start()

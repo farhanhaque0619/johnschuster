@@ -38,8 +38,10 @@ import discovery
 
 PORT = 47800                # TCP carries audio, UDP (same number) clock sync + discovery
 MAGIC = "syncaudio/1"
-BLOCK_MS = 5                # capture block size
-OUTPUT_LATENCY = 0.04       # requested CoreAudio output buffer; compensated, so it only costs headroom
+BLOCK_MS = 10               # capture block size
+OUTPUT_LATENCY = 0.1        # CoreAudio output buffer: roomy, so a busy moment in Python can't click;
+                            # it's compensated, so it only adds to the delay
+INPUT_LATENCY = 0.05        # same for capturing from BlackHole
 APP_VERSION = "dev"         # the app sets its build version; exchanged so Macs can spot mismatches
 
 # --------------------------------------------------------------------- wire
@@ -447,9 +449,12 @@ class SoundDeviceOutput:
         info = sd.query_devices(device, "output")
         self.name = info["name"]
         self.channels = min(2, info["max_output_channels"])
+        self.underflows = 0         # macOS ran out of audio to play: a click
         failed = []
 
         def callback(outdata, frames, t, status):
+            if status and status.output_underflow:
+                self.underflows += 1
             try:
                 lead = t.outputBufferDacTime - t.currentTime
                 if not 0.0 <= lead < 1.0:          # timestamps unavailable
@@ -474,9 +479,12 @@ class SoundDeviceOutput:
 class SoundDeviceInput:
     def __init__(self, sd, device: int, rate: int, channels: int, on_block, now=time.monotonic):
         self.name = sd.query_devices(device, "input")["name"]
+        self.overflows = 0          # capture fell behind and lost audio: a click for everyone
         failed = []
 
         def callback(indata, frames, t, status):
+            if status and status.input_overflow:
+                self.overflows += 1
             try:
                 back = t.currentTime - t.inputBufferAdcTime
                 if not 0.0 <= back < 1.0:
@@ -489,7 +497,7 @@ class SoundDeviceInput:
 
         self.stream = sd.InputStream(samplerate=rate, device=device, channels=channels,
                                      dtype="float32", blocksize=rate * BLOCK_MS // 1000,
-                                     latency="low", callback=callback)
+                                     latency=INPUT_LATENCY, callback=callback)
 
     def start(self):
         self.stream.start()
@@ -711,7 +719,7 @@ class AutoDelay:
     every listener gets each block before it is due. Raises at once when a
     listener runs short; lowers only after a long calm stretch."""
 
-    START, MIN, MAX = 0.15, 0.08, 1.5
+    START, MIN, MAX = 0.25, 0.12, 1.5   # 100 ms output buffer + capture buffer + Wi-Fi
     MARGIN = 0.05       # spare audio every speaker should keep (Wi-Fi and thread hiccups)
     SETTLE = 5.0        # seconds listeners need to measure a change
     CALM = 120.0        # seconds of plenty of headroom before lowering
@@ -1049,6 +1057,9 @@ class Client:
             "wifi_ms": round(self.clock.rtt * 1000, 1) if self.clock.rtt is not None else None,
             "headroom_ms": round(room * 1000) if room is not None else None,
             "dropouts": p.dropouts if p else 0,
+            "resyncs": p.resyncs if p else 0,
+            "underflows": getattr(self.output, "underflows", 0),
+            "glitches": glitches(p, self.output),
         }
 
     def status(self) -> str:
@@ -1107,9 +1118,15 @@ class SystemOutput:
             self.previous = None
 
 
-def player_info(p: Player | None) -> dict:
+def glitches(p: Player | None, output=None) -> int:
+    """Every audible hiccup: audio arriving late, sync jumps, macOS running short."""
+    return (p.dropouts + p.resyncs if p else 0) + getattr(output, "underflows", 0)
+
+
+def player_info(p: Player | None, output=None) -> dict:
     return {"state": player_state(p), "err_ms": round(p.err * 1000, 2) if p else None,
-            "dropouts": p.dropouts if p else 0}
+            "dropouts": p.dropouts if p else 0, "resyncs": p.resyncs if p else 0,
+            "underflows": getattr(output, "underflows", 0), "glitches": glitches(p, output)}
 
 
 class HostSession:
@@ -1268,7 +1285,8 @@ class HostSession:
             "level": round(h.take_level(), 3), "silent_s": round(self.silent_for(), 1),
             "delay_ms": round(h.delay * 1000), "auto_delay": self.auto is not None,
             "group_volume": h.group_volume, "group_volume_by": h.group_volume_by,
-            "local": player_info(h.local) if h.local else None,
+            "local": player_info(h.local, self.output) if h.local else None,
+            "capture_glitches": getattr(self.source, "overflows", 0),
             "listeners": h.listeners(),
         }
 
@@ -1542,6 +1560,7 @@ def main(argv=None):
     sub.add_parser("devices", help="list audio devices").set_defaults(func=run_devices)
 
     args = ap.parse_args(argv)
+    sys.setswitchinterval(0.001)    # hand Python to the audio threads sooner: fewer clicks
     # Quit cleanly (restoring the sound output) when the terminal is closed or killed.
     if threading.current_thread() is threading.main_thread():
         for sig in (signal.SIGTERM, signal.SIGHUP):

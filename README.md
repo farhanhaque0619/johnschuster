@@ -39,6 +39,20 @@ curl -fsSL https://github.com/farhanhaque0619/johnschuster/releases/latest/downl
 
 ## Use it
 
+### Connect your Macs once, then switch whose music plays
+
+1. Open SyncAudio on both Macs. Each shows the other under **Macs nearby**.
+2. On one Mac click **Connect**; on the other click **Accept**.
+3. Both now show **Connected Macs**. Click **Play my music** (or **Play theirs**) on
+   either Mac to choose whose music everyone hears. Switch any time, from any
+   Mac: the Mac you pick starts sharing and the others start listening by
+   themselves. **Stop the music** stops it for everyone.
+
+Connected Macs remember each other and reconnect whenever both apps are open.
+Only Macs you've accepted can switch your music. ✕ next to a Mac disconnects it.
+
+### Or share without connecting
+
 **On the Mac playing the music:** click **Start sharing**.
 
 * The first time, SyncAudio offers to install **BlackHole**, a free audio
@@ -49,7 +63,7 @@ curl -fsSL https://github.com/farhanhaque0619/johnschuster/releases/latest/downl
 * Play anything. The bar moves when sound is coming through.
 
 **On every other Mac:** open SyncAudio. The sharing Mac appears under
-**Join a Mac that's sharing**; click **Join**. That's it. Add as many Macs as
+**Macs nearby**; click **Just listen** (or **Join** for older versions). That's it. Add as many Macs as
 you like, and they all stay in sync.
 
 **Controls (each Mac has its own):**

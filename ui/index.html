@@ -104,6 +104,11 @@
   .stats label { color: var(--muted); font-size: 12px; }
 
   .card.update { border: 1.5px solid var(--accent); }
+  .card.room .list li { padding: 9px 0; }
+  .pill { font-size: 12px; font-weight: 600; color: var(--green); background: color-mix(in srgb, var(--green) 14%, transparent);
+          padding: 4px 9px; border-radius: 99px; white-space: nowrap; }
+  .request { background: var(--accent-soft); border-radius: 10px; padding: 10px 12px; margin: 8px 0; }
+  .request .row { margin-top: 6px; }
   .card.update .row { align-items: center; }
   .banner { display: flex; gap: 10px; align-items: flex-start; background: #fff1f0; color: #8a1c1c; border-radius: 12px;
             padding: 10px 12px; margin-bottom: 12px; }
@@ -144,6 +149,16 @@
     </div>
   </div>
 
+  <!-- ============================== connected Macs (rooms) -->
+  <div class="card room" id="room" hidden>
+    <div id="room-requests"></div>
+    <div id="room-body">
+      <div class="card-head"><h2>Connected Macs</h2><button class="link" id="room-stop" data-play="" hidden>Stop the music</button></div>
+      <ul class="list" id="room-members"></ul>
+      <p class="muted small" id="room-hint"></p>
+    </div>
+  </div>
+
   <div class="banner" id="banner" role="alert" hidden>
     <div class="grow"><div id="banner-text"></div><div id="banner-actions"></div></div>
     <button class="x" data-action="dismiss" aria-label="Dismiss">×</button>
@@ -162,9 +177,12 @@
     </div>
 
     <div class="card">
-      <div class="card-head"><h2>Join a Mac that's sharing</h2></div>
+      <div class="card-head"><h2>Macs nearby</h2></div>
+      <p class="muted small" style="margin:0 0 4px">Connect once and your Macs stay paired: either of you can
+        switch whose music plays.</p>
       <ul class="list" id="nearby"></ul>
-      <div class="empty" id="nearby-empty"><span class="spinner"></span><span>Looking for Macs sharing on this Wi-Fi…</span></div>
+      <p class="small" id="room-note" style="margin:6px 0" hidden></p>
+      <div class="empty" id="nearby-empty"><span class="spinner"></span><span>Looking for Macs with SyncAudio open on this Wi-Fi…</span></div>
       <div class="help" id="nearby-blocked" hidden>
         <b>macOS is blocking SyncAudio from your network.</b> Turn on SyncAudio in Local Network settings,
         then quit and reopen SyncAudio.
@@ -257,7 +275,7 @@
       <div class="stats">
         <div><b id="st-wifi">–</b><label>Wi-Fi delay</label></div>
         <div><b id="st-delay">–</b><label>Audio delay</label></div>
-        <div><b id="st-drop">0</b><label>Dropouts</label></div>
+        <div><b id="st-drop">0</b><label>Glitches</label></div>
       </div>
       <div class="help" id="listen-version" style="margin-bottom:0" hidden></div>
     </div>
@@ -342,6 +360,7 @@ function render(s) {
   for (const m of ["idle", "hosting", "listening"]) show($("view-" + m), mode === m);
   renderBanner(s);
   renderUpdate(s);
+  renderRoom(s);
   if (mode === "idle") renderIdle(s);
   if (mode === "hosting") renderHosting(s);
   if (mode === "listening") renderListening(s);
@@ -359,6 +378,40 @@ function renderBanner(s) {
   show($("banner"), !!text);
   setHTML($("banner-text"), text);
   setHTML($("banner-actions"), actions);
+}
+
+function renderRoom(s) {
+  const r = s.room;
+  const members = r ? r.members : [];
+  const busy = r && (members.length || r.requests.length || r.asking.length);
+  show($("room"), !!busy);
+  if (!busy) return;
+  setHTML($("room-requests"), r.requests.map((q) => `<div class="request"><b>${esc(q.name)}</b> wants to connect with this Mac,
+      so you can play each other's music.<div class="row">
+      <button class="primary" data-room="accept" data-id="${esc(q.id)}">Accept</button>
+      <button data-room="decline" data-id="${esc(q.id)}">Not now</button></div></div>`).join("")
+    + r.asking.map((a) => `<div class="request"><span class="spinner" style="display:inline-block;vertical-align:-2px"></span>
+      Waiting for <b>${esc(a.name)}</b> to accept on that Mac…</div>`).join(""));
+  show($("room-body"), members.length > 0);
+  const src = r.source.id;
+  const row = (id, name, sub, online, isMe) => {
+    const playing = src === id;
+    const action = playing ? `<span class="pill">♫ Playing</span>`
+      : `<button class="${isMe ? "primary" : ""}" data-play="${esc(id)}" ${online ? "" : "disabled"}>
+           ${isMe ? "Play my music" : "Play theirs"}</button>`;
+    const forget = isMe ? "" : `<button class="link small" data-room="forget" data-id="${esc(id)}" title="Disconnect">✕</button>`;
+    return `<li><span class="dot ${online ? "in_sync" : ""}"></span><div class="grow"><div class="name">${esc(name)}</div>
+            <div class="muted small">${esc(sub)}</div></div>${action}${forget}</li>`;
+  };
+  let rows = row(s.device_id, "This Mac", src === s.device_id ? "Everyone hears this Mac" : "", true, true);
+  for (const m of members) {
+    const sub = !m.online ? "Offline: open SyncAudio on it" : src === m.id ? "Everyone hears this Mac" : "";
+    rows += row(m.id, m.name, sub, m.online, false);
+  }
+  setHTML($("room-members"), rows);
+  show($("room-stop"), !!src);
+  $("room-hint").textContent = r.paused ? "You left this round. Pick whose music to play to rejoin."
+    : src ? `Chosen by ${r.source.by}. Anyone here can switch.` : "Pick whose music everyone hears. Anyone here can switch.";
 }
 
 function renderUpdate(s) {
@@ -404,11 +457,18 @@ function renderIdle(s) {
     setHTML($("setup-actions"), actions);
   }
 
-  const items = s.nearby.map((h) =>
-    `<li>${macIcon}<div class="grow"><div class="name">${esc(h.name)}</div><div class="muted small">${esc(h.address)}</div></div>
-      <button class="primary" data-join="${esc(h.address)}">Join</button></li>`).join("");
+  const items = s.nearby.map((h) => {
+    const connect = h.id ? `<button class="primary" data-connect="${esc(h.address)}" data-port="${esc(h.room_port || "")}">Connect</button>` : "";
+    const join = h.sharing ? `<button class="${h.id ? "" : "primary"}" data-join="${esc(h.address)}">${h.id ? "Just listen" : "Join"}</button>` : "";
+    const sub = h.sharing ? `${h.address} · sharing now` : h.address;
+    return `<li>${macIcon}<div class="grow"><div class="name">${esc(h.name)}</div><div class="muted small">${esc(sub)}</div></div>
+      ${join}${connect}</li>`;
+  }).join("");
   setHTML($("nearby"), items);
   show($("nearby-empty"), !s.nearby.length);
+  show($("room-note"), !!(s.room && s.room.note));
+  if (s.room && s.room.note) $("room-note").textContent = s.room.note;
+  $("btn-share").textContent = s.room && s.room.members.length ? "Play my music" : "Start sharing";
   show($("nearby-blocked"), !!s.scan_blocked);
   show($("nearby-help"), !s.nearby.length && s.idle_s > 8 && !s.scan_blocked);
   const pr = s.probe;
@@ -439,11 +499,13 @@ function renderHosting(s) {
   show($("firewall-warn"), !!(s.firewall && s.firewall.needs_fix));
 
   let rows = "";
-  if (h.local) rows += speakerRow("This Mac", h.local.state, (STATE_TEXT[h.local.state] || "") + (h.output ? " · " + h.output : ""));
+  if (h.local) rows += speakerRow("This Mac", h.local.state, (STATE_TEXT[h.local.state] || "") + (h.output ? " · " + h.output : "")
+    + (h.local.glitches ? ` · ${h.local.glitches} glitch${h.local.glitches === 1 ? "" : "es"}` : ""));
   for (const l of h.listeners) {
     let detail = STATE_TEXT[l.state] || "Connecting…";
     if (l.wifi_ms != null) detail += ` · Wi-Fi ${ms(l.wifi_ms)}`;
-    if (l.dropouts) detail += ` · ${l.dropouts} dropout${l.dropouts === 1 ? "" : "s"}`;
+    const g = l.glitches ?? l.dropouts;
+    if (g) detail += ` · ${g} glitch${g === 1 ? "" : "es"}`;
     if (l.version !== s.app.version) detail += l.version ? ` · has SyncAudio ${l.version}` : " · older SyncAudio, needs updating";
     rows += speakerRow(l.name, l.state, detail);
   }
@@ -496,7 +558,7 @@ function renderListening(s) {
     : `<b>${esc(host)} has an older SyncAudio.</b> It can't keep AirPods and other headphones fed, so you may hear nothing. Update SyncAudio on that Mac.`;
   $("st-wifi").textContent = ms(c.wifi_ms);
   $("st-delay").textContent = ms(c.delay_ms);
-  $("st-drop").textContent = c.dropouts ?? 0;
+  $("st-drop").textContent = c.glitches ?? c.dropouts ?? 0;
 }
 
 function renderControls(s) {
@@ -532,6 +594,9 @@ document.addEventListener("click", (e) => {
   if (b.dataset.action) post(b.dataset.action);
   else if (b.dataset.open) post("open", {what: b.dataset.open});
   else if (b.dataset.join) post("join", {address: b.dataset.join});
+  else if (b.dataset.connect !== undefined) post("connect", {address: b.dataset.connect, room_port: Number(b.dataset.port) || null});
+  else if (b.dataset.play !== undefined) post("play", {id: b.dataset.play || null});
+  else if (b.dataset.room) post("room", {action: b.dataset.room, id: b.dataset.id});
   else if (b.dataset.copy) { post("copy", {text: b.dataset.copy}); b.textContent = "Copied"; }
   else if (b.dataset.nudge) {
     const step = Number(b.dataset.nudge) * (e.shiftKey ? 10 : 1);

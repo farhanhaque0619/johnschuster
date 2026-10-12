@@ -18,7 +18,8 @@ import shutil
 import subprocess
 import threading
 
-SERVICE = "_syncaudio._tcp"
+SERVICE = "_syncaudio._tcp"            # a Mac that's sharing
+ROOM_SERVICE = "_syncaudio-room._tcp"  # any open SyncAudio 1.1+ (rooms)
 P2P = ["-includep2p", "-includeAWDL"]    # also over AWDL, the AirDrop link
 SWEEP_CHUNK = 512                         # addresses per scan
 
@@ -85,8 +86,8 @@ class Advertiser:
 
     P2P_SECONDS = 180
 
-    def __init__(self, name: str, port: int, ip: str):
-        self.name, self.port, self.ip = name, port, ip
+    def __init__(self, name: str, port: int, ip: str, service: str = SERVICE):
+        self.name, self.port, self.ip, self.service = name, port, ip, service
         self.proc = None
         self._stop = threading.Event()
 
@@ -96,7 +97,7 @@ class Advertiser:
         return self
 
     def _spawn(self, p2p: bool):
-        cmd = [dns_sd(), *(P2P if p2p else []), "-R", self.name, SERVICE, "local", str(self.port),
+        cmd = [dns_sd(), *(P2P if p2p else []), "-R", self.name, self.service, "local", str(self.port),
                f"ip={self.ip}", "v=1"]
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -116,8 +117,8 @@ class Advertiser:
 class Browser:
     """Keeps a live list of sharing Macs found with Bonjour: {name: ip}."""
 
-    def __init__(self, p2p: bool = True):
-        self.p2p = p2p
+    def __init__(self, p2p: bool = True, service: str = SERVICE):
+        self.p2p, self.service = p2p, service
         self.found: dict = {}
         self.proc = None
         self._stop = threading.Event()
@@ -134,7 +135,7 @@ class Browser:
 
     def _run(self):
         flags = P2P if self.p2p else []
-        self.proc = subprocess.Popen([dns_sd(), *flags, "-B", SERVICE, "local"], stdout=subprocess.PIPE,
+        self.proc = subprocess.Popen([dns_sd(), *flags, "-B", self.service, "local"], stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, text=True, bufsize=1)
         for line in self.proc.stdout:
             if self._stop.is_set():
@@ -150,7 +151,7 @@ class Browser:
 
     def _resolve(self, name: str, flags: list):
         try:
-            proc = subprocess.Popen([dns_sd(), *flags, "-L", name, SERVICE, "local"], stdout=subprocess.PIPE,
+            proc = subprocess.Popen([dns_sd(), *flags, "-L", name, self.service, "local"], stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, text=True)
         except OSError:
             return

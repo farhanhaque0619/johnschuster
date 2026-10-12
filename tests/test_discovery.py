@@ -105,7 +105,7 @@ class ProbeTest(unittest.TestCase):
             result = sa.probe("127.0.0.1", port, seconds=1.0)
             self.assertTrue(result["ok"], result)
             self.assertEqual((result["host_name"], result["discovery"]), ("Den", True))
-            self.assertGreater(result["audio_blocks_per_s"], 150)          # 5 ms blocks
+            self.assertGreater(result["audio_blocks_per_s"], 75)           # 10 ms blocks
             self.assertEqual(host.listeners(), [], "a connection test isn't shown as a listener")
         finally:
             clicks.close()
