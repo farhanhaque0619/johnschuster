@@ -161,9 +161,11 @@ class Player:
     changes) by jumping straight to the right sample.
     """
 
-    HARD_RESYNC = 0.02      # seconds off -> jump
+    HARD_RESYNC = 0.02      # seconds off -> jump (while getting in sync)
+    LOCKED_RESYNC = 0.04    # once in sync, a jump (which you hear) only beyond this
     GAIN = 0.5              # 1/s: how hard small errors are corrected
-    MAX_SKEW = 0.002        # never run more than 0.2 % fast or slow
+    MAX_SKEW = 0.002        # normally never run more than 0.2 % fast or slow
+    FAST_SKEW = 0.006       # up to 0.6 % to win back a bigger slip without a jump
     SMOOTH = 0.05           # error filter, per callback
 
     def __init__(self, rate: int, channels: int, to_server, settings: Settings | None = None,
@@ -186,6 +188,7 @@ class Player:
             self.err = 0.0                      # filtered timing error, seconds (+ = early)
             self.starving = False
             self.synced = False
+            self.locked = False                 # has been in sync since the last jump
             self.dropouts = 0
             self.resyncs = 0
             self.margins: deque = deque(maxlen=200)    # spare audio after each callback, seconds
@@ -264,14 +267,17 @@ class Player:
                 return np.zeros((frames, out_channels), np.float32)
             an, at = self.anchor
             target = an + (server_t - at - s.offset_ms / 1000) * self.rate
-            if self.read_n is None or abs(self.read_n - target) > self.HARD_RESYNC * self.rate:
+            limit = self.LOCKED_RESYNC if self.locked else self.HARD_RESYNC
+            if self.read_n is None or abs(self.read_n - target) > limit * self.rate:
                 if self.read_n is not None:
                     self.resyncs += 1
                 self.read_n = int(round(target))
                 self.acc = self.err = 0.0
+                self.locked = False
                 self.margins.clear()
             self.err += self.SMOOTH * ((self.read_n - target) / self.rate - self.err)
-            skew = min(self.MAX_SKEW, max(-self.MAX_SKEW, -self.GAIN * self.err))
+            most = self.FAST_SKEW if abs(self.err) > 0.008 else self.MAX_SKEW
+            skew = min(most, max(-most, -self.GAIN * self.err))
             self.acc += skew * frames
             k = int(self.acc)
             self.acc -= k
@@ -285,7 +291,7 @@ class Player:
             if self.starving or abs(self.err) > 0.010:
                 self.synced = False
             elif abs(self.err) < 0.003:
-                self.synced = True
+                self.synced = self.locked = True
         if k:
             seg = stretch(seg, frames)
         return self._mix(seg, out_channels) * s.volume
@@ -454,22 +460,52 @@ def pick_output(sd, query: str | None) -> int:
     raise SetupError("no_device", "No speakers found.")
 
 
+class StreamClock:
+    """Turns PortAudio's timestamps into time.monotonic() time.
+
+    The audio callbacks are Python, so they run when Python gets round to them
+    (another thread may hold the GIL), sometimes many milliseconds after macOS
+    asked for audio. Timing a buffer by "now" inside the callback wanders with
+    that delay, and the players chase the wander: "Getting in sync", then a jump
+    you hear. PortAudio's own timestamps are taken on time, so use those. The
+    offset between the two clocks is the smallest difference seen: the callback
+    that ran soonest. It creeps up very slowly, in case the clocks run at
+    slightly different rates (on a Mac they are the same clock)."""
+
+    CREEP = 2e-5        # seconds per second
+
+    def __init__(self, now=time.monotonic):
+        self.now = now
+        self._offset = self._last = None
+
+    def offset(self, stream_now: float) -> float:
+        diff = self.now() - stream_now
+        if self._offset is None or diff < self._offset:
+            self._offset = diff
+        else:
+            self._offset += max(0.0, stream_now - self._last) * self.CREEP
+        self._last = stream_now
+        return self._offset
+
+
 class SoundDeviceOutput:
     def __init__(self, sd, device: int, rate: int, render, now=time.monotonic):
         info = sd.query_devices(device, "output")
         self.name = info["name"]
         self.channels = min(2, info["max_output_channels"])
         self.underflows = 0         # macOS ran out of audio to play: a click
+        clock = StreamClock(now)
         failed = []
 
         def callback(outdata, frames, t, status):
             if status and status.output_underflow:
                 self.underflows += 1
             try:
+                offset = clock.offset(t.currentTime)
                 lead = t.outputBufferDacTime - t.currentTime
                 if not 0.0 <= lead < 1.0:          # timestamps unavailable
                     lead = self.stream.latency
-                outdata[:] = render(frames, now() + lead, self.channels)
+                outdata[:] = render(frames, t.currentTime + offset + lead, self.channels)
             except Exception as e:  # never let an exception kill the stream
                 outdata.fill(0)
                 if not failed:
@@ -490,16 +526,18 @@ class SoundDeviceInput:
     def __init__(self, sd, device: int, rate: int, channels: int, on_block, now=time.monotonic):
         self.name = sd.query_devices(device, "input")["name"]
         self.overflows = 0          # capture fell behind and lost audio: a click for everyone
+        clock = StreamClock(now)
         failed = []
 
         def callback(indata, frames, t, status):
             if status and status.input_overflow:
                 self.overflows += 1
             try:
+                offset = clock.offset(t.currentTime)
                 back = t.currentTime - t.inputBufferAdcTime
                 if not 0.0 <= back < 1.0:
                     back = frames / rate
-                on_block(indata.copy(), now() - back)
+                on_block(indata.copy(), t.currentTime + offset - back)
             except Exception as e:  # keep capturing whatever happens
                 if not failed:
                     failed.append(e)
