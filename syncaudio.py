@@ -192,6 +192,7 @@ class Player:
             self.last_sound = None                      # when a block with actual sound last arrived
             self._dac = None
             self._dac_frames = 0
+            self._dac_odd = 0                   # buffers in a row whose reported time made no sense
 
     def feed(self, n: int, play_at: float, pcm: np.ndarray) -> None:
         k = len(pcm)
@@ -240,6 +241,15 @@ class Player:
             predicted = self._dac + self._dac_frames / self.rate
             if abs(dac - predicted) < 0.05:
                 dac = predicted + 0.02 * (dac - predicted)
+                self._dac_odd = 0
+            else:
+                # AirPods now and then report a wildly wrong time for one buffer. Believe a
+                # jump only when it persists; reacting to a one-off spike means a click.
+                self._dac_odd += 1
+                if self._dac_odd < 3 and abs(dac - predicted) < 0.5:   # bigger: the output restarted
+                    dac = predicted
+                else:
+                    self._dac_odd = 0
         self._dac, self._dac_frames = dac, frames
         return dac
 
@@ -270,11 +280,11 @@ class Player:
             if self.read_n + need > self.n_first:      # the stream has started
                 self.margins.append((self.n_end - self.read_n - need) / self.rate)
             self.read_n += need
-            # Shown as "in sync" within 2 ms; only shown as off beyond 5 ms, so
-            # the label doesn't flicker on Wi-Fi's normal sub-millisecond wobble.
-            if self.starving or abs(self.err) > 0.005:
+            # Shown as "in sync" within 3 ms; only shown as off beyond 10 ms, so the label
+            # doesn't flicker on Wi-Fi's and Bluetooth's normal wobble (a few ms is inaudible).
+            if self.starving or abs(self.err) > 0.010:
                 self.synced = False
-            elif abs(self.err) < 0.002:
+            elif abs(self.err) < 0.003:
                 self.synced = True
         if k:
             seg = stretch(seg, frames)
@@ -509,7 +519,8 @@ class SoundDeviceInput:
 
 # --------------------------------------------------------------------- host
 class _Peer:
-    QUEUE = 600     # blocks (3 s); a Mac that falls further behind is dropped
+    QUEUE = 300     # blocks waiting to be sent (3 s at 10 ms blocks)
+    SNDBUF = 64 * 1024      # the kernel's share of the backlog: ~1/3 s of audio
 
     def __init__(self, sock: socket.socket, name: str, ip: str):
         self.sock, self.name, self.ip = sock, name, ip
@@ -518,12 +529,34 @@ class _Peer:
         self.version = None
         self.joined = time.monotonic()
         self.alive = True
+        self.late = 0           # blocks skipped because the network couldn't deliver them in time
 
-    def push(self, data: bytes):
-        try:
-            self.q.put_nowait(data)
-        except queue.Full:
-            self.alive = False
+    def push(self, data: bytes, play_at: float = math.inf):
+        """Queue a frame; audio carries the time it must be playing by."""
+        while True:
+            try:
+                self.q.put_nowait((play_at, data))
+                return
+            except queue.Full:
+                try:                # Wi-Fi fell far behind: the oldest audio is useless now
+                    if self.q.get_nowait()[0] != math.inf:
+                        self.late += 1
+                except queue.Empty:
+                    pass
+
+    def take(self, now: float, timeout: float = 0.5) -> bytes:
+        """Everything queued, minus audio that would reach the speaker too late.
+        Sending that would only build a backlog, and the listener would fall
+        further behind with every Wi-Fi hiccup until it gave up."""
+        items = [self.q.get(timeout=timeout)]
+        while True:
+            try:
+                items.append(self.q.get_nowait())
+            except queue.Empty:
+                break
+        keep = [data for play_at, data in items if play_at > now]
+        self.late += len(items) - len(keep)
+        return b"".join(keep)
 
 
 class Host:
@@ -619,7 +652,7 @@ class Host:
             pcm16 = (np.clip(pcm, -1, 1) * 32767).astype("<i2").tobytes()
             data = frame(AUDIO, AUDIO_HDR.pack(n, play_at) + pcm16)
             for p in peers:
-                p.push(data)
+                p.push(data, play_at)
 
     def take_level(self) -> float:
         """Loudest sample since the last call (0..1)."""
@@ -630,7 +663,7 @@ class Host:
         with self.lock:
             peers = sorted((p for p in self.peers if not getattr(p, "probe", False)), key=lambda p: p.name.lower())
         return [{"state": "waiting", **p.stats, "name": p.name, "ip": p.ip, "version": p.version,
-                 "connected_s": time.monotonic() - p.joined}
+                 "connected_s": time.monotonic() - p.joined, "late": p.late}
                 for p in peers]
 
     def _udp_loop(self):
@@ -661,6 +694,7 @@ class Host:
         peer = None
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _Peer.SNDBUF)
             sock.settimeout(5)
             kind, payload = recv_frame(sock)
             hello = json.loads(payload)
@@ -679,15 +713,11 @@ class Host:
             threading.Thread(target=self._read_stats, args=(peer,), daemon=True).start()
             while self.running and peer.alive:
                 try:
-                    chunks = [peer.q.get(timeout=0.5)]
+                    data = peer.take(self.now())
                 except queue.Empty:
                     continue
-                while True:
-                    try:
-                        chunks.append(peer.q.get_nowait())
-                    except queue.Empty:
-                        break
-                sock.sendall(b"".join(chunks))
+                if data:
+                    sock.sendall(data)
         except (OSError, ValueError, ConnectionError):
             pass
         finally:
@@ -724,6 +754,7 @@ class AutoDelay:
     SETTLE = 5.0        # seconds listeners need to measure a change
     CALM = 120.0        # seconds of plenty of headroom before lowering
     NO_LOWER = 600.0    # after a raise, don't lower for this long
+    STEP = 0.3          # most a single raise adds: one long Wi-Fi stall isn't the new normal
 
     def __init__(self, delay: float = START):
         self.delay = delay
@@ -741,7 +772,7 @@ class AutoDelay:
             return None
         worst = min(s["headroom_ms"] for s in reports.values()) / 1000
         if dropped or worst < self.MARGIN / 2:
-            new = self.delay + max(0.05, self.MARGIN - worst)
+            new = self.delay + min(self.STEP, max(0.05, self.MARGIN - worst))
             self.raised_at = now
         elif worst > 4 * self.MARGIN and now - self.raised_at > self.NO_LOWER:
             if self.calm_since is None:
@@ -1185,7 +1216,8 @@ class HostSession:
             self.stop()
             raise
         self.started = time.monotonic()
-        self.advertiser = discovery.Advertiser(self.name, self.port, lan_ip()).start()
+        # Never over the AirDrop link while sharing: it makes Wi-Fi hop channels and stall (dropouts).
+        self.advertiser = discovery.Advertiser(self.name, self.port, lan_ip(), p2p_seconds=0).start()
         threading.Thread(target=self._tick_loop, daemon=True).start()
         return self
 

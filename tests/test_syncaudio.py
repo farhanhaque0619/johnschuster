@@ -169,6 +169,23 @@ class PlayerTest(unittest.TestCase):
         out = p.render(100, 10.5)               # first frame due at 10.5 -> sample 24000
         self.assertAlmostEqual(out[0, 0], 24000 / RATE, places=4)
 
+    def test_one_wild_airpods_timestamp_is_ignored(self):
+        p = sa.Player(RATE, 2, lambda t: t)
+        p.feed(0, 10.0, np.ones((RATE * 2, 2), np.float32))
+        t = 10.0
+        for _ in range(20):
+            p.render(480, t)
+            t += 0.01
+        p.render(480, t + 0.08)                 # one buffer reported 80 ms off
+        for _ in range(20):
+            t += 0.01
+            p.render(480, t)
+        self.assertEqual(p.resyncs, 0, "a one-off spike is not a reason to jump (a click)")
+        for _ in range(5):                      # but a lasting change (output restarted) is followed
+            t += 0.01
+            p.render(480, t + 0.08)
+        self.assertEqual(p.resyncs, 1)
+
     def test_channel_modes_and_volume(self):
         settings = sa.Settings()
         p = sa.Player(RATE, 2, lambda t: t, settings)
@@ -458,9 +475,37 @@ class AutoDelayTest(unittest.TestCase):
         lowered = [t for t in range(1, 600) if auto.update(t, {"a": {"headroom_ms": 400, "dropouts": 0}})]
         self.assertEqual(lowered, [])
 
+    def test_one_long_stall_does_not_max_out_the_delay(self):
+        auto = sa.AutoDelay()
+        new = auto.update(10, {"a": {"headroom_ms": -3000, "dropouts": 40}})
+        self.assertAlmostEqual(new, 0.25 + sa.AutoDelay.STEP)
+
     def test_waits_for_measurements(self):
         self.assertIsNone(sa.AutoDelay().update(10, {"a": {"headroom_ms": None, "dropouts": 0}}))
         self.assertIsNone(sa.AutoDelay().update(10, {}))
+
+
+class SlowWifiTest(unittest.TestCase):
+    """Saifan: "it stays for a minute or two, then really bad static, more delay
+    every few seconds, then it gets dropped." A listener whose Wi-Fi can't keep
+    up must get only audio it can still play, not an ever-growing backlog."""
+
+    def test_audio_that_would_arrive_late_is_never_sent(self):
+        peer = sa._Peer(None, "Saifan", "10.49.64.113")
+        for i in range(10):
+            peer.push(b"a%d" % i, play_at=100.0 + i)
+        peer.push(b"update")                        # control messages always go
+        self.assertEqual(peer.take(now=106.5), b"a7a8a9update")
+        self.assertEqual(peer.late, 7)
+
+    def test_a_stalled_listener_is_not_disconnected(self):
+        peer = sa._Peer(None, "Saifan", "10.49.64.113")
+        for i in range(sa._Peer.QUEUE + 50):        # Wi-Fi stalled for 3.5 s
+            peer.push(b"x", play_at=float(i))
+        self.assertTrue(peer.alive)
+        self.assertEqual(peer.q.qsize(), sa._Peer.QUEUE)
+        self.assertEqual(peer.q.queue[0][0], 50.0, "the oldest audio is the one let go")
+        self.assertEqual(peer.late, 50)
 
 
 def wait_until(check, timeout=10.0):

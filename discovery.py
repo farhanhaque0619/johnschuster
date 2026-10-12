@@ -47,8 +47,9 @@ class Sweep:
 
     def __init__(self, ip: str, network: ipaddress.IPv4Network, chunk: int = SWEEP_CHUNK):
         me = int(ipaddress.IPv4Address(ip))
-        hosts = [int(h) for h in network.hosts()] if network.num_addresses <= 1 << 16 else \
-            [int(h) for h in ipaddress.IPv4Network(f"{ip}/16", strict=False).hosts()]
+        # Campus networks can be /15 (131k addresses); bigger ones are limited to the /15 around us.
+        net = network if network.num_addresses <= 1 << 17 else ipaddress.IPv4Network(f"{ip}/15", strict=False)
+        hosts = [int(h) for h in net.hosts()]
         hosts.sort(key=lambda h: abs(h - me))       # neighbours first: DHCP tends to cluster
         self.order = [str(ipaddress.IPv4Address(h)) for h in hosts if h != me]
         self.chunk, self.pos = chunk, 0
@@ -86,32 +87,41 @@ class Advertiser:
 
     P2P_SECONDS = 180
 
-    def __init__(self, name: str, port: int, ip: str, service: str = SERVICE):
+    def __init__(self, name: str, port: int, ip: str, service: str = SERVICE, p2p_seconds: float = P2P_SECONDS):
         self.name, self.port, self.ip, self.service = name, port, ip, service
+        self.p2p_seconds = p2p_seconds
         self.proc = None
+        self.p2p = None
         self._stop = threading.Event()
+        self._lock = threading.Lock()
 
     def start(self):
         if dns_sd():
             threading.Thread(target=self._run, daemon=True).start()
         return self
 
-    def _spawn(self, p2p: bool):
-        cmd = [dns_sd(), *(P2P if p2p else []), "-R", self.name, self.service, "local", str(self.port),
-               f"ip={self.ip}", "v=1"]
-        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def set_p2p(self, on: bool):
+        """Announce over the AirDrop link too (on) or only on the Wi-Fi network (off)."""
+        with self._lock:
+            if self._stop.is_set() or on == self.p2p or not dns_sd():
+                return
+            if self.proc:
+                self.proc.terminate()
+            cmd = [dns_sd(), *(P2P if on else []), "-R", self.name, self.service, "local", str(self.port),
+                   f"ip={self.ip}", "v=1"]
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.p2p = on
 
     def _run(self):
-        self.proc = self._spawn(p2p=True)
-        if self._stop.wait(self.P2P_SECONDS):
-            return
-        self.proc.terminate()
-        self.proc = self._spawn(p2p=False)
+        self.set_p2p(self.p2p_seconds > 0)
+        if self.p2p_seconds > 0 and not self._stop.wait(self.p2p_seconds):
+            self.set_p2p(False)
 
     def stop(self):
-        self._stop.set()
-        if self.proc:
-            self.proc.terminate()
+        with self._lock:
+            self._stop.set()
+            if self.proc:
+                self.proc.terminate()
 
 
 class Browser:

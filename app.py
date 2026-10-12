@@ -36,7 +36,7 @@ import syncaudio as sa
 import updater
 
 APP_NAME = "SyncAudio"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 DOWNLOAD_URL = "https://github.com/farhanhaque0619/johnschuster/releases/latest"
 BLACKHOLE_URL = "https://existential.audio/downloads/BlackHole2ch-0.7.1.pkg"
 BLACKHOLE_SHA256 = "57b540f27a3e29c37e310e01bee0fdfab76733087e47f997ef9dccf851400dcf"
@@ -96,6 +96,31 @@ def default_prefs_file() -> Path:
     return Path.home() / "Library" / "Application Support" / APP_NAME / "prefs.json"
 
 
+class NoNap:
+    """Keeps macOS from napping the app while music plays. Behind Spotify the
+    window is hidden, and after a minute or two App Nap slows the threads that
+    move audio over Wi-Fi: it arrives later and later until it breaks up."""
+
+    def __init__(self):
+        self.token = None
+
+    def hold(self, on: bool):
+        if on == (self.token is not None):
+            return
+        try:
+            import Foundation
+            info = Foundation.NSProcessInfo.processInfo()
+            if on:
+                options = (getattr(Foundation, "NSActivityUserInitiated", 0x00FFFFFF | 1 << 20)
+                           | getattr(Foundation, "NSActivityLatencyCritical", 0xFF00000000))
+                self.token = info.beginActivityWithOptions_reason_(options, "Playing music in sync")
+            else:
+                info.endActivity_(self.token)
+                self.token = None
+        except Exception:           # not a Mac (tests), or no PyObjC: Info.plist still turns App Nap off
+            self.token = None
+
+
 class Controller:
     """Owns the current session (sharing or listening) and everything the UI shows."""
 
@@ -111,6 +136,7 @@ class Controller:
         self.opener = opener or (lambda url: subprocess.run(["open", url], check=False))
         self.switch_tool = switch_tool or bundled_switch_tool()
         self.session = None
+        self.nonap = NoNap()
         self.error = None
         self.blackhole = None
         self.nearby: list = []
@@ -200,6 +226,9 @@ class Controller:
         subnet, remembered addresses) and listen to Bonjour, AirDrop link included."""
         sweep, sweep_ip = None, None
         while self.running:
+            self.nonap.hold(self.session is not None)
+            if self.room_ad:        # the AirDrop link only while looking for each other, never while playing
+                self.room_ad.set_p2p(self.session is None)
             if self.session is not None:
                 for attr in ("browser", "room_browser"):    # the AirDrop link costs Wi-Fi latency
                     if getattr(self, attr):
@@ -316,7 +345,8 @@ class Controller:
         except OSError as e:
             self._log(f"! connecting Macs is off: port {port} is in use ({e}). Is SyncAudio open twice?")
             return
-        self.room_ad = discovery.Advertiser(self.name, port, sa.lan_ip(), service=discovery.ROOM_SERVICE).start()
+        self.room_ad = discovery.Advertiser(self.name, port, sa.lan_ip(), service=discovery.ROOM_SERVICE,
+                                            p2p_seconds=0).start()
 
     def _room_changed(self):
         threading.Thread(target=self._apply_room, daemon=True).start()
@@ -510,9 +540,10 @@ class Controller:
         if what in LINKS:
             self.opener(LINKS[what])
 
-    def copy(self, text: str):
+    def copy(self, text: str, limit: int | None = 500):
+        """Put text on the clipboard. The page may only copy short things (an address)."""
         try:
-            subprocess.run(["pbcopy"], input=str(text)[:500], text=True, check=False, timeout=5)
+            subprocess.run(["pbcopy"], input=str(text)[:limit], text=True, check=False, timeout=5)
         except (OSError, subprocess.SubprocessError):
             pass
 
@@ -581,8 +612,44 @@ class Controller:
         }
         return json.dumps(report, indent=1, default=str)
 
+    def summary(self, report: dict) -> str:
+        """The few numbers that matter, short enough to paste into a chat."""
+        s = report.get("session") or {}
+        lines = [f"SyncAudio {report['app'].get('version')} ({(report['app'].get('commit') or 'dev')[:7]}) "
+                 f"macOS {report['macos']}",
+                 f"network {report['network']['ip']} {report['network']['subnet']} "
+                 f"firewall {'on' if (report['network'].get('firewall_app') or {}).get('enabled') else 'off'}",
+                 f"mode {s.get('mode', 'idle')} delay {s.get('delay_ms')} ms output {s.get('output')}"]
+        if s.get("mode") == "hosting":
+            lines.append(f"capture glitches {s.get('capture_glitches')} level {s.get('level')} silent {s.get('silent_s')} s")
+            lines.append(f"this Mac {s.get('local')}")
+            lines += [f"listener {l.get('name')}: {l.get('state')} err {l.get('err_ms')} wifi {l.get('wifi_ms')} "
+                      f"headroom {l.get('headroom_ms')} dropouts {l.get('dropouts')} resyncs {l.get('resyncs')} "
+                      f"underflows {l.get('underflows')} late {l.get('late')} v{l.get('version')}" for l in s.get("listeners", [])]
+        elif s:
+            lines.append(f"listening to {s.get('host_name')} v{s.get('host_version')}: {s.get('state')} err {s.get('err_ms')} "
+                         f"wifi {s.get('wifi_ms')} headroom {s.get('headroom_ms')} dropouts {s.get('dropouts')} "
+                         f"resyncs {s.get('resyncs')} underflows {s.get('underflows')} silent {s.get('incoming_silent_s')}")
+        history = report.get("history", [])[-30:]
+        if history:
+            keys = ("state", "err_ms", "headroom_ms", "dropouts", "delay_ms")
+            def compact(h):
+                src = h.get("local") or h
+                return "/".join(str(src.get(k, h.get(k))) for k in keys)
+            lines.append("last 30 s (state/err/headroom/dropouts/delay): " + " ".join(compact(h) for h in history[::3]))
+        lines += [f"event {e['msg']}" for e in report.get("events", [])[-8:]]
+        return "\n".join(lines)
+
     def copy_diagnostics(self):
-        self.copy(self.diagnostics())
+        full = self.diagnostics()
+        report = json.loads(full)
+        path = Path.home() / "Desktop" / "SyncAudio diagnostics.txt"
+        try:
+            path.write_text(full)
+            where = f"\nfull report: {path}"
+        except OSError:
+            where = ""
+        self.copy(self.summary(report) + where, limit=None)
 
     def shutdown(self):
         self.running = False

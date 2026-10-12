@@ -31,6 +31,8 @@ app = BUNDLE(
         "LSMinimumSystemVersion": "14.0",   # numpy wheels need Sonoma
         "LSApplicationCategoryType": "public.app-category.music",
         "NSHighResolutionCapable": True,
+        # No App Nap: hidden behind Spotify, a napping app can't keep the audio coming in time.
+        "NSAppSleepDisabled": True,
         # BlackHole is an input device, so capturing it needs microphone permission.
         "NSMicrophoneUsageDescription":
             "SyncAudio listens to the BlackHole audio driver to share what this Mac is playing. "

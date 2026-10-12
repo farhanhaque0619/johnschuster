@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
@@ -41,9 +42,14 @@ class SubnetTest(unittest.TestCase):
             seen.update(sweep.next_targets())
         self.assertEqual(len(seen), 4093, "every other address on the /20 in 8 scans")
 
-    def test_huge_networks_are_limited_to_the_surrounding_slash_16(self):
+    def test_huge_networks_are_limited_to_the_surrounding_slash_15(self):
         sweep = discovery.Sweep("10.48.71.96", ipaddress.IPv4Network("10.0.0.0/8"))
-        self.assertEqual(len(sweep.order), 65533)
+        self.assertEqual(len(sweep.order), 131069)
+
+    def test_a_campus_slash_15_is_swept_whole(self):
+        # Farhan (10.48.71.96) and Saifan (10.49.64.113) share 10.48.0.0/15.
+        sweep = discovery.Sweep("10.48.71.96", ipaddress.IPv4Network("10.48.0.0/15"))
+        self.assertIn("10.49.64.113", sweep.order)
 
 
 class BonjourParsingTest(unittest.TestCase):
@@ -152,3 +158,20 @@ class DiagnosticsTest(unittest.TestCase):
         for key in ("app", "macos", "network", "devices", "session", "history", "events"):
             self.assertIn(key, report)
         self.assertEqual(report["devices"][0]["name"], "BlackHole 2ch")
+
+    def test_copy_gives_a_whole_summary_and_saves_the_full_report(self):
+        # Copy diagnostics used to cut everything off after 500 characters.
+        home = Path(tempfile.mkdtemp())
+        (home / "Desktop").mkdir()
+        c = app.Controller(sd=FakeSoundDevice(), prefs_file=home / "p.json", scan=False)
+        copied = []
+        with mock.patch.object(app.Path, "home", return_value=home), \
+                mock.patch.object(app.subprocess, "run", wraps=app.subprocess.run) as run:
+            run.side_effect = lambda cmd, **kw: copied.append(kw["input"]) if cmd == ["pbcopy"] else \
+                mock.DEFAULT
+            c.copy_diagnostics()
+        text = copied[-1]
+        self.assertIn("SyncAudio " + app.VERSION, text)
+        self.assertTrue(text.rstrip().endswith("SyncAudio diagnostics.txt"), text)
+        full = json.loads((home / "Desktop" / "SyncAudio diagnostics.txt").read_text())
+        self.assertIn("history", full)

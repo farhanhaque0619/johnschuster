@@ -120,9 +120,13 @@ going, so everyone else still hears it.
   `sudo ifconfig awdl0 down` in Terminal on each Mac turns that off until restart,
   which often fixes repeated dropouts. It also stops Macs finding each other over
   the AirDrop link, so you may need to type the address.
+* **Plays fine for a minute or two, then breaks up and drops.** Update to 1.1.1 or
+  newer. Older versions let a listener fall further and further behind when the Wi-Fi
+  couldn't keep up, and macOS slowed the app down once its window was hidden.
 * **Still stuck?** Open **Settings → Copy diagnostics** and paste the result to
-  whoever is helping you. It has the versions, network details, audio devices and
-  the last few minutes of sync measurements.
+  whoever is helping you. That's a short summary; the full report (versions, network
+  details, audio devices and the last few minutes of sync measurements) is saved as
+  **SyncAudio diagnostics.txt** on your Desktop.
 * **No sound on the sharing Mac after a crash.** Open SyncAudio again and it puts the
   sound back, or pick your speakers in **Control Center → Sound**.
 
