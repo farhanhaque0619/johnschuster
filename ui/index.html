@@ -103,6 +103,8 @@
   .stats b { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
   .stats label { color: var(--muted); font-size: 12px; }
 
+  .card.update { border: 1.5px solid var(--accent); }
+  .card.update .row { align-items: center; }
   .banner { display: flex; gap: 10px; align-items: flex-start; background: #fff1f0; color: #8a1c1c; border-radius: 12px;
             padding: 10px 12px; margin-bottom: 12px; }
   @media (prefers-color-scheme: dark) { .banner { background: #3a1f1f; color: #ffb4b0; } }
@@ -135,6 +137,13 @@
     </div>
   </header>
 
+  <div class="card update" id="update" hidden>
+    <div class="row">
+      <div class="grow" id="update-text"></div>
+      <div id="update-action"></div>
+    </div>
+  </div>
+
   <div class="banner" id="banner" role="alert" hidden>
     <div class="grow"><div id="banner-text"></div><div id="banner-actions"></div></div>
     <button class="x" data-action="dismiss" aria-label="Dismiss">×</button>
@@ -156,6 +165,11 @@
       <div class="card-head"><h2>Join a Mac that's sharing</h2></div>
       <ul class="list" id="nearby"></ul>
       <div class="empty" id="nearby-empty"><span class="spinner"></span><span>Looking for Macs sharing on this Wi-Fi…</span></div>
+      <div class="help" id="nearby-blocked" hidden>
+        <b>macOS is blocking SyncAudio from your network.</b> Turn on SyncAudio in Local Network settings,
+        then quit and reopen SyncAudio.
+        <button class="link" data-open="local_network">Open Local Network settings</button>
+      </div>
       <div class="help" id="nearby-help" hidden>
         <b>Not showing up?</b>
         <ul>
@@ -168,8 +182,10 @@
       </div>
       <form class="row" id="manual" autocomplete="off">
         <input type="text" id="manual-address" placeholder="Address, e.g. 192.168.1.23" spellcheck="false">
-        <button type="submit">Join</button>
+        <button type="button" id="btn-test">Test</button>
+        <button type="submit" class="primary">Join</button>
       </form>
+      <p class="small" id="probe-result" style="margin:8px 0 0" hidden></p>
     </div>
 
     <div class="card">
@@ -268,6 +284,11 @@
     <summary>Settings</summary>
     <div class="ctl"><span>This Mac's name</span><input type="text" id="name" maxlength="40"></div>
     <div class="ctl"><span>Play on this Mac while sharing</span><input type="checkbox" id="play-local"></div>
+    <div class="ctl"><span>Version</span><span id="version-text" style="flex:1"></span>
+      <button class="link" data-action="check-update">Check for updates</button></div>
+    <div class="ctl"><span>Something wrong?</span>
+      <button id="btn-diag">Copy diagnostics</button>
+      <span class="muted small" id="diag-hint"></span></div>
   </details>
 
   <footer id="footer"></footer>
@@ -314,6 +335,7 @@ function render(s) {
   $("this-mac").textContent = "This Mac: " + s.name;
   for (const m of ["idle", "hosting", "listening"]) show($("view-" + m), mode === m);
   renderBanner(s);
+  renderUpdate(s);
   if (mode === "idle") renderIdle(s);
   if (mode === "hosting") renderHosting(s);
   if (mode === "listening") renderListening(s);
@@ -331,6 +353,26 @@ function renderBanner(s) {
   show($("banner"), !!text);
   setHTML($("banner-text"), text);
   setHTML($("banner-actions"), actions);
+}
+
+function renderUpdate(s) {
+  const u = s.update || {};
+  const busy = u.state === "downloading" || u.state === "restarting";
+  show($("update"), !!u.available || busy || u.state === "failed");
+  let text, action = "";
+  if (busy) {
+    text = `<div class="row"><span class="spinner"></span><span>${esc(u.message)}</span></div>`;
+  } else if (u.state === "failed") {
+    text = esc(u.message);
+    action = `<button data-open="download">Download page</button>`;
+  } else {
+    text = `<b>New version ready</b>${u.version ? " (" + esc(u.version) + ")" : ""}.<br>
+            <span class="muted small">Takes a few seconds. SyncAudio restarts by itself.</span>`;
+    action = `<button class="primary" data-action="install-update">Update now</button>`;
+  }
+  setHTML($("update-text"), text);
+  setHTML($("update-action"), action);
+  $("version-text").textContent = s.app.version + (u.checked && !u.available ? " (up to date)" : "");
 }
 
 function renderIdle(s) {
@@ -361,7 +403,15 @@ function renderIdle(s) {
       <button class="primary" data-join="${esc(h.address)}">Join</button></li>`).join("");
   setHTML($("nearby"), items);
   show($("nearby-empty"), !s.nearby.length);
-  show($("nearby-help"), !s.nearby.length && s.idle_s > 8);
+  show($("nearby-blocked"), !!s.scan_blocked);
+  show($("nearby-help"), !s.nearby.length && s.idle_s > 8 && !s.scan_blocked);
+  const pr = s.probe;
+  show($("probe-result"), !!pr);
+  if (pr) {
+    $("probe-result").textContent = pr.running ? `Testing ${pr.address}…`
+      : pr.ok ? `✓ ${pr.host_name || pr.address} is sharing and reachable (Wi-Fi ${ms(pr.wifi_ms)}). Click Join.`
+      : `✗ ${pr.problem ? pr.problem.message : "That Mac answered but no audio came through."}`;
+  }
   if (fresh("manual-address") && !$("manual-address").value && s.last_host) $("manual-address").value = s.last_host;
 }
 
@@ -390,9 +440,11 @@ function renderHosting(s) {
     rows += speakerRow(l.name, l.state, detail);
   }
   setHTML($("speakers"), rows);
-  $("join-hint").innerHTML = h.listeners.length
+  setHTML($("join-hint"), h.listeners.length
     ? `${h.listeners.length} Mac${h.listeners.length === 1 ? "" : "s"} listening. More can join any time.`
-    : `No one has joined yet. On another Mac, open SyncAudio: this Mac shows up under <b>Join</b>. Address: <b>${esc(s.address)}</b>`;
+    : `No one has joined yet. On another Mac, open SyncAudio: this Mac shows up under <b>Join</b>.
+       If it doesn't, they can type this address: <b>${esc(s.address)}</b>
+       <button class="link" data-copy="${esc(s.address)}">Copy</button>`);
 
   for (const b of $("delay-mode").children) b.classList.toggle("on", (b.dataset.mode === "auto") === h.auto_delay);
   show($("delay-manual"), !h.auto_delay);
@@ -415,7 +467,8 @@ function renderListening(s) {
     if (c.state === "no_audio") detail = "Wi-Fi hiccup. The sharing Mac raises the delay automatically.";
   } else if (c.connection === "retrying") {
     dot = "bad"; title = "Can't reach " + host;
-    detail = "Make sure it's still sharing and both Macs are on the same Wi-Fi. Retrying…";
+    detail = (c.problem ? c.problem.message : "Make sure it's still sharing and both Macs are on the same Wi-Fi.")
+      + " Retrying…";
   } else {
     title = "Connecting to " + host + "…";
   }
@@ -461,6 +514,7 @@ document.addEventListener("click", (e) => {
   if (b.dataset.action) post(b.dataset.action);
   else if (b.dataset.open) post("open", {what: b.dataset.open});
   else if (b.dataset.join) post("join", {address: b.dataset.join});
+  else if (b.dataset.copy) { post("copy", {text: b.dataset.copy}); b.textContent = "Copied"; }
   else if (b.dataset.nudge) {
     const step = Number(b.dataset.nudge) * (e.shiftKey ? 10 : 1);
     post("settings", {offset_ms: (state ? state.settings.offset_ms : 0) + step});
@@ -484,6 +538,14 @@ $("manual").addEventListener("submit", (e) => {
   if (address) post("join", {address});
 });
 $("manual-address").addEventListener("input", () => touched("manual-address"));
+$("btn-test").addEventListener("click", () => {
+  const address = $("manual-address").value.trim();
+  if (address) post("test-connection", {address});
+});
+$("btn-diag").addEventListener("click", () => {
+  post("copy-diagnostics");
+  $("diag-hint").textContent = "Copied. Paste it to whoever is helping you.";
+});
 
 const timers = {};
 function slider(id, send) {

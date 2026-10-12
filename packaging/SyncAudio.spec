@@ -10,7 +10,8 @@ a = Analysis(
     [os.path.join(root, "app.py")],
     pathex=[root],
     binaries=[(switch, ".")] if switch else [],
-    datas=[(os.path.join(root, "ui"), "ui")],
+    datas=[(os.path.join(root, "ui"), "ui")] + (
+        [(os.path.join(root, "build_info.json"), ".")] if os.path.exists(os.path.join(root, "build_info.json")) else []),
     hiddenimports=["webview.platforms.cocoa"],
     excludes=["tkinter", "matplotlib", "PIL"],
 )

@@ -15,6 +15,7 @@ sample at the same time.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import math
 import os
@@ -32,6 +33,8 @@ import time
 from collections import deque
 
 import numpy as np
+
+import discovery
 
 PORT = 47800                # TCP carries audio, UDP (same number) clock sync + discovery
 MAGIC = "syncaudio/1"
@@ -109,7 +112,13 @@ class ClockSync:
         drift = 0.0
         if np.ptp(dt) > 4.0:
             drift = float(np.clip(np.polyfit(dt, off, 1)[0], -self.MAX_DRIFT, self.MAX_DRIFT))
-        self.estimate = (t_ref, float(np.median(off - drift * dt)), drift)
+        offset = float(np.median(off - drift * dt))
+        if self.estimate is not None:       # move a fifth of the way: steadier, still follows
+            last_ref, last_offset, last_drift = self.estimate
+            expected = last_offset + last_drift * (t_ref - last_ref)
+            if abs(offset - expected) < 0.005:
+                offset = expected + 0.2 * (offset - expected)
+        self.estimate = (t_ref, offset, drift)
         self.rtt = float(np.median(best[:, 2]))
 
     def to_server(self, t_local: float):
@@ -145,11 +154,11 @@ class Player:
     Each output callback knows when its first frame will reach the speaker.
     That gives the sample index that should be playing, which is compared with
     the one actually being read. Small errors (clock drift) are trimmed by
-    adding or skipping single frames now and then; large ones (start-up, Wi-Fi
-    stalls) by jumping straight to the right sample.
+    adding or skipping single frames now and then; large ones (start-up, delay
+    changes) by jumping straight to the right sample.
     """
 
-    HARD_RESYNC = 0.015     # seconds off -> jump
+    HARD_RESYNC = 0.02      # seconds off -> jump
     GAIN = 0.5              # 1/s: how hard small errors are corrected
     MAX_SKEW = 0.002        # never run more than 0.2 % fast or slow
     SMOOTH = 0.05           # error filter, per callback
@@ -173,8 +182,12 @@ class Player:
             self.acc = 0.0
             self.err = 0.0                      # filtered timing error, seconds (+ = early)
             self.starving = False
+            self.synced = False
             self.dropouts = 0
             self.resyncs = 0
+            self.margins: deque = deque(maxlen=200)    # spare audio after each callback, seconds
+            self._dac = None
+            self._dac_frames = 0
 
     def feed(self, n: int, play_at: float, pcm: np.ndarray) -> None:
         k = len(pcm)
@@ -196,26 +209,42 @@ class Player:
 
     def _read(self, start: int, need: int) -> np.ndarray:
         out = np.zeros((need, self.channels), np.float32)
+        missing = start + need > self.n_end
+        if missing and not self.starving:
+            self.dropouts += 1          # audio wasn't here in time
+        self.starving = missing
+        if missing:
+            # Clean silence: playing the bit that did arrive, then a hole, over
+            # and over, is what crackle and "static" are made of.
+            return out
         lo = max(start, self.n_first, self.n_end - self.cap)
-        hi = min(start + need, self.n_end)
+        hi = start + need
         if hi > lo:
             i, m = lo % self.cap, hi - lo
             first = min(m, self.cap - i)
             out[lo - start:lo - start + first] = self.ring[i:i + first]
             out[lo - start + first:hi - start] = self.ring[:m - first]
-        missing = start + need > self.n_end
-        if missing and not self.starving:
-            self.dropouts += 1          # audio wasn't here in time
-        self.starving = missing
         return out
+
+    def _smooth_dac(self, dac: float, frames: int) -> float:
+        """Buffers play back to back, so each one's start is predictable from
+        the last. Bluetooth outputs (AirPods) report it with several ms of
+        jitter, so follow the reports only slowly; jump if the device skipped."""
+        if self._dac is not None:
+            predicted = self._dac + self._dac_frames / self.rate
+            if abs(dac - predicted) < 0.05:
+                dac = predicted + 0.02 * (dac - predicted)
+        self._dac, self._dac_frames = dac, frames
+        return dac
 
     def render(self, frames: int, dac_local: float, out_channels: int = 2) -> np.ndarray:
         """Audio for `frames` frames whose first frame hits the speaker at dac_local."""
         s = self.settings
-        server_t = self.to_server(dac_local)
         with self.lock:
+            server_t = self.to_server(self._smooth_dac(dac_local, frames))
             if server_t is None or self.anchor is None:
                 self.read_n = None
+                self.synced = False
                 return np.zeros((frames, out_channels), np.float32)
             an, at = self.anchor
             target = an + (server_t - at - s.offset_ms / 1000) * self.rate
@@ -224,13 +253,23 @@ class Player:
                     self.resyncs += 1
                 self.read_n = int(round(target))
                 self.acc = self.err = 0.0
+                self.margins.clear()
             self.err += self.SMOOTH * ((self.read_n - target) / self.rate - self.err)
             skew = min(self.MAX_SKEW, max(-self.MAX_SKEW, -self.GAIN * self.err))
             self.acc += skew * frames
             k = int(self.acc)
             self.acc -= k
-            seg = self._read(self.read_n, frames + k)
-            self.read_n += frames + k
+            need = frames + k
+            seg = self._read(self.read_n, need)
+            if self.read_n + need > self.n_first:      # the stream has started
+                self.margins.append((self.n_end - self.read_n - need) / self.rate)
+            self.read_n += need
+            # Shown as "in sync" within 2 ms; only shown as off beyond 5 ms, so
+            # the label doesn't flicker on Wi-Fi's normal sub-millisecond wobble.
+            if self.starving or abs(self.err) > 0.005:
+                self.synced = False
+            elif abs(self.err) < 0.002:
+                self.synced = True
         if k:
             seg = stretch(seg, frames)
         return self._mix(seg, out_channels) * s.volume
@@ -249,7 +288,13 @@ class Player:
 
     @property
     def in_sync(self) -> bool:
-        return self.read_n is not None and not self.starving and abs(self.err) < 0.001
+        return self.read_n is not None and self.synced
+
+    def headroom(self):
+        """How much audio was left over at the tightest recent moment, in
+        seconds (negative: it ran out). This is what the delay has to cover."""
+        margins = list(self.margins)
+        return min(margins) if margins else None
 
 
 # ------------------------------------------------------------------ capture
@@ -557,7 +602,7 @@ class Host:
 
     def listeners(self) -> list:
         with self.lock:
-            peers = sorted(self.peers, key=lambda p: p.name.lower())
+            peers = sorted((p for p in self.peers if not getattr(p, "probe", False)), key=lambda p: p.name.lower())
         return [{"state": "waiting", **p.stats, "name": p.name, "ip": p.ip,
                  "connected_s": time.monotonic() - p.joined}
                 for p in peers]
@@ -599,9 +644,11 @@ class Host:
                 "rate": self.rate, "channels": self.channels, "delay": self.delay,
                 "group_volume": self.group_volume, "name": self.name}).encode()))
             peer = _Peer(sock, str(hello.get("name") or ip)[:40], ip)
+            peer.probe = bool(hello.get("probe"))
             with self.lock:
                 self.peers.add(peer)
-            self.log(f"+ {peer.name} joined ({ip})")
+            if not peer.probe:
+                self.log(f"+ {peer.name} joined ({ip})")
             threading.Thread(target=self._read_stats, args=(peer,), daemon=True).start()
             while self.running and peer.alive:
                 try:
@@ -621,7 +668,7 @@ class Host:
                 peer.alive = False
                 with self.lock:
                     self.peers.discard(peer)
-                if self.running:
+                if self.running and not peer.probe:
                     self.log(f"- {peer.name} left")
             sock.close()
 
@@ -646,7 +693,7 @@ class AutoDelay:
     listener runs short; lowers only after a long calm stretch."""
 
     START, MIN, MAX = 0.15, 0.08, 1.5
-    MARGIN = 0.03       # headroom every listener should keep
+    MARGIN = 0.05       # spare audio every speaker should keep (Wi-Fi and thread hiccups)
     SETTLE = 5.0        # seconds listeners need to measure a change
     CALM = 120.0        # seconds of plenty of headroom before lowering
     NO_LOWER = 600.0    # after a raise, don't lower for this long
@@ -703,16 +750,18 @@ def broadcast_targets() -> set:
     return targets
 
 
-def discover_all(port: int = PORT, timeout: float = 1.0, targets=None) -> list:
-    """Every host answering on the local network, as [(ip, name)]."""
+def discover_all(port: int = PORT, timeout: float = 1.0, targets=None, errors: list | None = None) -> list:
+    """Every host answering on the local network, as [(ip, name)]. Send
+    failures are appended to `errors` (errno values) when given."""
     found = {}
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         for target in (broadcast_targets() if targets is None else targets):
             try:
                 s.sendto(DISCOVER, (target, port))
-            except OSError:
-                pass
+            except OSError as e:
+                if errors is not None:
+                    errors.append(e.errno)
         end = time.monotonic() + timeout
         while (left := end - time.monotonic()) > 0:
             s.settimeout(left)
@@ -732,6 +781,66 @@ def discover(port: int = PORT, timeout: float = 1.5, address: str | None = None)
     """The first host found, as (ip, name), or None."""
     hosts = discover_all(port, timeout, [address] if address else None)
     return hosts[0] if hosts else None
+
+
+def explain(e: BaseException) -> dict:
+    """Turn a connection error into something a person can act on."""
+    code = getattr(e, "errno", None)
+    if isinstance(e, socket.timeout) or code == errno.ETIMEDOUT:
+        return {"code": "timeout", "message": "No answer from that address. Either this Wi-Fi keeps devices "
+                "apart (common on school, office and hotel networks) or the firewall on that Mac is blocking "
+                "SyncAudio."}
+    if code == errno.ECONNREFUSED:
+        return {"code": "refused", "message": "That Mac answered, but it isn't sharing. Open SyncAudio there "
+                "and click Start sharing."}
+    if code == errno.EHOSTUNREACH:
+        return {"code": "local_network", "message": "macOS is blocking SyncAudio from the local network. "
+                "Turn on SyncAudio in System Settings → Privacy & Security → Local Network, then reopen it."}
+    if code == getattr(errno, "EHOSTDOWN", -1):
+        return {"code": "no_host", "message": "Nothing answers at that address. Check it's typed right and "
+                "that both Macs are on the same Wi-Fi."}
+    if code == errno.ENETUNREACH:
+        return {"code": "no_network", "message": "This Mac isn't connected to a network."}
+    return {"code": "other", "message": f"Couldn't connect ({e})."}
+
+
+def probe(address: str, port: int = PORT, seconds: float = 2.0) -> dict:
+    """Check a sharing Mac step by step: answers discovery, accepts the
+    connection, streams audio, answers clock pings."""
+    result = {"address": address, "port": port, "ok": False,
+              "discovery": bool(discover_all(port, 1.0, [address]))}
+    try:
+        sock = socket.create_connection((address, port), timeout=3)
+    except OSError as e:
+        return {**result, "step": "connect", "problem": explain(e)}
+    try:
+        sock.settimeout(3)
+        sock.sendall(frame(HELLO, json.dumps({"magic": MAGIC, "name": "connection test", "probe": True}).encode()))
+        kind, payload = recv_frame(sock)
+        header = json.loads(payload)
+        blocks, size, end = 0, 0, time.monotonic() + seconds
+        while time.monotonic() < end:
+            kind, payload = recv_frame(sock)
+            if kind == AUDIO:
+                blocks, size = blocks + 1, size + len(payload)
+    except (OSError, ValueError, ConnectionError) as e:
+        return {**result, "step": "stream", "problem": explain(e)}
+    finally:
+        sock.close()
+    rtts = []
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(0.5)
+        for seq in range(10):
+            t1 = time.monotonic()
+            try:
+                s.sendto(PING.pack(b"P", seq, t1), (address, port))
+                if PONG.unpack(s.recv(64))[1] == seq:
+                    rtts.append(time.monotonic() - t1)
+            except (OSError, struct.error):
+                pass
+    return {**result, "ok": blocks > 0 and bool(rtts), "step": "done", "host_name": header.get("name"),
+            "audio_blocks_per_s": round(blocks / seconds), "audio_kbps": round(size * 8 / seconds / 1000),
+            "wifi_ms": round(float(np.median(rtts)) * 1000, 1) if rtts else None, "pings_answered": len(rtts)}
 
 
 def player_state(p: Player | None) -> str:
@@ -761,7 +870,7 @@ class Client:
         self._output_lock = threading.Lock()
         self.phase = "searching"        # searching | connecting | connected | retrying
         self.error = None
-        self.leads: deque = deque(maxlen=400)
+        self.problem = None             # why we can't connect, for people (see explain)
         self.running = False
 
     @property
@@ -809,6 +918,8 @@ class Client:
             except (OSError, ValueError, KeyError, ConnectionError) as e:
                 if self.running and self.phase == "connected":
                     self.log(f"lost the host ({e}); reconnecting...")
+                elif isinstance(e, OSError):
+                    self.problem = explain(e)
             except Exception as e:  # e.g. the speaker can't be opened
                 self.error = str(e)
                 self.log(f"error: {e!r}")
@@ -832,7 +943,6 @@ class Client:
             self.delay = float(hdr.get("delay", 0))
             self.group_volume = float(hdr.get("group_volume", 1.0))
             self.clock = ClockSync()
-            self.leads.clear()
             with self._output_lock:
                 if self.player is None or (self.player.rate, self.player.channels) != (rate, channels):
                     if self.output:
@@ -842,7 +952,7 @@ class Client:
                     self.output = self.open_output(rate, self.player.render)
                 else:
                     self.player.reset()
-            self.error = None
+            self.error = self.problem = None
             self._sock = sock
             threading.Thread(target=self._ping_loop, args=(ip, stop), daemon=True).start()
             self.phase = "connected"
@@ -854,9 +964,6 @@ class Client:
                     n, play_at = AUDIO_HDR.unpack_from(payload)
                     pcm = np.frombuffer(payload, "<i2", offset=AUDIO_HDR.size)
                     self.player.feed(n, play_at, pcm.reshape(-1, channels).astype(np.float32) / 32768)
-                    server_now = self.clock.to_server(self.now())
-                    if server_now is not None:
-                        self.leads.append(play_at - server_now)
                 elif kind == UPDATE:
                     update = json.loads(payload)
                     self.delay = float(update.get("delay", self.delay))
@@ -908,10 +1015,7 @@ class Client:
                 stop.wait(0.03 if self.now() - started < 2 else 0.2)
 
     def headroom(self):
-        """How early the tightest recent block arrived, minus output latency."""
-        if not self.leads or not self.output:
-            return None
-        return min(self.leads) - getattr(self.output, "latency", 0.0)
+        return self.player.headroom() if self.player else None
 
     def stats(self) -> dict:
         p = self.player
@@ -1000,7 +1104,7 @@ class HostSession:
         self.switch_output, self.switch_tool, self.log = switch_output, switch_tool, log
         self.auto = AutoDelay() if delay_ms is None else None
         self.fixed_delay = None if delay_ms is None else delay_ms / 1000
-        self.host = self.output = self.source = self.system = None
+        self.host = self.output = self.source = self.system = self.advertiser = None
         self._stop = threading.Event()
 
     @property
@@ -1042,6 +1146,7 @@ class HostSession:
             self.stop()
             raise
         self.started = time.monotonic()
+        self.advertiser = discovery.Advertiser(self.name, self.port, lan_ip()).start()
         threading.Thread(target=self._tick_loop, daemon=True).start()
         return self
 
@@ -1051,7 +1156,10 @@ class HostSession:
             ticks += 1
             if self.auto and self.host:
                 now = time.monotonic()
-                ready = {l["ip"] + l["name"]: l for l in self.host.listeners() if l["connected_s"] > 5}
+                ready = {l["ip"] + l["name"]: l for l in self.host.listeners() if l["connected_s"] > 1.5}
+                local = self.host.local
+                if local and local.headroom() is not None:     # this Mac's own speaker or AirPods
+                    ready["this Mac"] = {"headroom_ms": local.headroom() * 1000, "dropouts": local.dropouts}
                 new = self.auto.update(now, ready)
                 if new is not None:
                     self.host.set_delay(new)
@@ -1069,7 +1177,8 @@ class HostSession:
         if not (self.system and self.system.tool) or self._stop.is_set():
             return
         current = self.system.current()
-        if not current or "blackhole" in current.lower():
+        changed, self._seen_output = current != getattr(self, "_seen_output", None), current
+        if not current or "blackhole" in current.lower() or not changed:
             return
         if self.output and not self.output_query and current != self.output.name:
             self._reopen_audio(current)
@@ -1109,6 +1218,8 @@ class HostSession:
 
     def stop(self):
         self._stop.set()
+        if self.advertiser:
+            self.advertiser.stop()
         if self.system:
             self.system.restore()
         for thing in (self.source, self.output):
@@ -1197,7 +1308,8 @@ class JoinSession:
         if self.output_query or not self.system.tool:
             return
         current = self.system.current()
-        if not current or current == self.output_name or "blackhole" in current.lower():
+        changed, self._seen_output = current != getattr(self, "_seen_output", self.output_name), current
+        if not current or not changed or current == self.output_name or "blackhole" in current.lower():
             return
         self.output_name = current
         self.client.reopen_output(before_open=lambda: refresh_portaudio(self.sd))
@@ -1212,7 +1324,7 @@ class JoinSession:
         c = self.client
         return {
             "mode": "listening", "address": self.address, "host_name": c.host_name,
-            "connection": c.phase, "output": self.output_name, "error": c.error,
+            "connection": c.phase, "output": self.output_name, "error": c.error, "problem": c.problem,
             "delay_ms": round(c.delay * 1000) if c.delay is not None else None,
             "group_volume": c.group_volume, "group_volume_by": c.group_volume_by,
             "clock": c.clock.estimate is not None, **c.stats(),

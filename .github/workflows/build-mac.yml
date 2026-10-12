@@ -46,13 +46,29 @@ jobs:
       - name: Build SyncAudio.app
         env:
           APP_VERSION: "1.0.${{ github.run_number }}"
-        run: pyinstaller --noconfirm --clean packaging/SyncAudio.spec
+        run: |
+          # The updater compares this with the published build.
+          printf '{"version": "%s", "commit": "%s"}\n' "$APP_VERSION" "$GITHUB_SHA" > build_info.json
+          pyinstaller --noconfirm --clean packaging/SyncAudio.spec
 
       - name: Check the built app
         run: |
           codesign --verify --deep --strict --verbose=2 dist/SyncAudio.app
           /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" dist/SyncAudio.app/Contents/Info.plist
           dist/SyncAudio.app/Contents/MacOS/SyncAudio --self-test
+
+      - name: Two copies of the app talking over this Mac's real network address
+        run: |
+          ip=$(ipconfig getifaddr en0 || ipconfig getifaddr en1 || echo 127.0.0.1)
+          echo "network address: $ip"
+          dist/SyncAudio.app/Contents/MacOS/SyncAudio --cli host --click --no-local --port 47811 --name "CI Mac" > host.log 2>&1 &
+          host=$!
+          sleep 4
+          status=0
+          dist/SyncAudio.app/Contents/MacOS/SyncAudio --probe "$ip" --port 47811 || status=$?
+          kill $host || true
+          cat host.log
+          exit $status
 
       - name: Open the real window once
         run: |
@@ -76,6 +92,20 @@ jobs:
           ln -s /Applications dmg/Applications
           cp "packaging/Read Me First.txt" dmg/
           hdiutil create -volname "SyncAudio" -srcfolder dmg -ov -format UDZO SyncAudio.dmg
+
+      - name: Update an installed copy from the new .dmg, for real
+        run: |
+          mkdir -p /tmp/apps && cp -R dist/SyncAudio.app /tmp/apps/
+          touch /tmp/apps/SyncAudio.app/old-copy        # gone once the new copy is swapped in
+          /tmp/apps/SyncAudio.app/Contents/MacOS/SyncAudio --apply-update "$PWD/SyncAudio.dmg" --no-relaunch
+          for i in $(seq 1 50); do [ -e /tmp/apps/SyncAudio.app/old-copy ] || break; sleep 0.2; done
+          test ! -e /tmp/apps/SyncAudio.app/old-copy
+          codesign --verify --deep --strict /tmp/apps/SyncAudio.app
+          /tmp/apps/SyncAudio.app/Contents/MacOS/SyncAudio --self-test
+          test -z "$(ls -A /tmp/apps | grep -v '^SyncAudio.app$')"   # staging cleaned up
+
+      - name: Ask GitHub for the latest build, like the app does
+        run: dist/SyncAudio.app/Contents/MacOS/SyncAudio --check-update
 
       - uses: actions/upload-artifact@v4
         with:
@@ -117,4 +147,4 @@ jobs:
           sed -i 's/^          //' notes.md
           gh release delete app-latest --repo "$REPO" --yes --cleanup-tag || true
           gh release create app-latest dmgs/*.dmg --repo "$REPO" --target "$GITHUB_SHA" --latest \
-            --title "SyncAudio for Mac" --notes-file notes.md
+            --title "SyncAudio 1.0.${{ github.run_number }}" --notes-file notes.md

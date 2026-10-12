@@ -24,6 +24,15 @@ and they sound like one bigger speaker, or like a stereo pair.
 Every Mac that plays music needs SyncAudio installed, and all of them must be on
 the **same Wi-Fi**.
 
+### Updating
+
+SyncAudio updates itself. When a new version is out, a banner with **Update now**
+appears. Click it and the app restarts as the new version a few seconds later.
+macOS may ask for the microphone and local-network permissions again; click **Allow**.
+
+(Versions from before the updater existed need one manual update: quit SyncAudio,
+then download and drag in the new `.dmg` as above, choosing **Replace**.)
+
 ## Use it
 
 **On the Mac playing the music:** click **Start sharing**.
@@ -62,24 +71,35 @@ going, so everyone else still hears it.
 * SyncAudio never uses the AirPods' microphone, so they stay in full-quality
   music mode. (Joining a call on them switches them to call mode, which sounds
   worse. That's macOS, not SyncAudio.)
-* macOS tells SyncAudio how much delay Bluetooth adds, and SyncAudio
-  compensates. That estimate isn't perfect, though. If one person on AirPods
-  hears things slightly early or late compared to the speakers in the room,
+* AirPods hold on to quite a lot of audio before playing it. SyncAudio measures
+  how much on every Mac and raises the delay to cover it automatically, so leave
+  **Delay** on **Auto**.
+* macOS's figure for how late Bluetooth plays isn't perfect. If someone on
+  AirPods hears things slightly early or late compared to speakers in the room,
   use **Sync nudge** on their Mac.
 
 ## If something's off
 
-* **The other Mac doesn't show up under Join.** Make sure both Macs are on the same
-  Wi-Fi (not a guest network). Check **System Settings → Privacy & Security → Local
-  Network** and turn on SyncAudio. You can also type the address shown on the sharing
-  Mac into the box under the list.
+* **The other Mac doesn't show up under Join.** Big networks (schools, offices,
+  apartment buildings) often hide Macs from each other. Type the address the
+  sharing Mac shows (it has a **Copy** button) into the box under the list, and
+  click **Test** to check it. After you've played together once, each Mac remembers
+  the other and finds it by itself next time. Also check **System Settings →
+  Privacy & Security → Local Network** has SyncAudio turned on.
+* **"Can't reach …" when joining.** The app says why underneath: wrong address,
+  the network keeping devices apart, the Mac not sharing, or macOS blocking
+  local-network access.
 * **The bar doesn't move while music plays.** Turn on SyncAudio in **System Settings →
   Privacy & Security → Microphone**, then stop and start sharing.
 * **Audio drops out.** With delay on Auto, SyncAudio raises the delay within a few
   seconds. If it keeps happening, move closer to the router or use 5 GHz Wi-Fi.
   Macs also briefly pause Wi-Fi to scan for AirDrop. Running
   `sudo ifconfig awdl0 down` in Terminal on each Mac turns that off until restart,
-  which often fixes repeated dropouts.
+  which often fixes repeated dropouts. It also stops Macs finding each other over
+  the AirDrop link, so you may need to type the address.
+* **Still stuck?** Open **Settings → Copy diagnostics** and paste the result to
+  whoever is helping you. It has the versions, network details, audio devices and
+  the last few minutes of sync measurements.
 * **No sound on the sharing Mac after a crash.** Open SyncAudio again and it puts the
   sound back, or pick your speakers in **Control Center → Sound**.
 

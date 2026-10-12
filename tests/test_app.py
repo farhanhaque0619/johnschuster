@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 import app  # noqa: E402
+import updater  # noqa: E402
 import syncaudio as sa  # noqa: E402
 from test_syncaudio import FakeSoundDevice, free_port  # noqa: E402
 
@@ -165,3 +166,69 @@ class AppTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UpdaterTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def bundle(self, name, version):
+        app_dir = self.tmp / name
+        (app_dir / "Contents").mkdir(parents=True)
+        (app_dir / "Contents" / "version").write_text(version)
+        return app_dir
+
+    def test_swap_replaces_the_app_after_it_quits_and_reopens_it(self):
+        old = self.bundle("SyncAudio.app", "1")
+        staging = self.tmp / ".SyncAudio-update-x"
+        staging.mkdir()
+        new = staging / "SyncAudio.app"
+        self.bundle(".SyncAudio-update-x/SyncAudio.app", "2")
+        running = subprocess.Popen(["sleep", "0.5"])         # stands in for the app that's quitting
+        threading.Thread(target=running.wait, daemon=True).start()   # reap it like launchd would
+        marker = self.tmp / "reopened"
+        script = updater.swap_script(old, new, staging, running.pid, f"touch {marker}")
+        start = time.monotonic()
+        subprocess.run(["/bin/sh", "-c", script], check=True, timeout=30)
+        self.assertGreaterEqual(time.monotonic() - start, 0.3, "waited for the app to quit")
+        self.assertEqual((old / "Contents" / "version").read_text(), "2")
+        self.assertTrue(marker.exists())
+        self.assertFalse(staging.exists(), "cleaned up")
+
+    def test_a_failed_swap_keeps_the_old_app(self):
+        old = self.bundle("SyncAudio.app", "1")
+        staging = self.tmp / ".SyncAudio-update-y"
+        staging.mkdir()
+        script = updater.swap_script(old, staging / "missing.app", staging, 999999, None)
+        subprocess.run(["/bin/sh", "-c", script], timeout=30)
+        self.assertEqual((old / "Contents" / "version").read_text(), "1")
+
+    def test_reads_the_latest_release(self):
+        release = {"name": "SyncAudio 1.0.9", "target_commitish": "abc123",
+                   "assets": [{"name": "SyncAudio.dmg", "browser_download_url": "https://example.com/SyncAudio.dmg"}]}
+        with mock.patch.object(updater, "_run", return_value=json.dumps(release)):
+            self.assertEqual(updater.latest_release(),
+                             {"version": "1.0.9", "commit": "abc123", "dmg_url": "https://example.com/SyncAudio.dmg"})
+        with mock.patch.object(updater, "_run", side_effect=RuntimeError("offline")):
+            self.assertIsNone(updater.latest_release())
+
+    def test_offers_an_update_only_when_the_build_differs(self):
+        c = app.Controller(sd=FakeSoundDevice(), prefs_file=self.tmp / "p.json", scan=False)
+        latest = {"version": "1.0.9", "commit": "new", "dmg_url": "https://example.com/SyncAudio.dmg"}
+        with mock.patch.object(updater, "latest_release", return_value=latest):
+            c.build = {"version": "1.0.8", "commit": "old"}
+            c.check_update()
+            self.assertTrue(c.state()["update"]["available"])
+            self.assertNotIn("dmg_url", c.state()["update"])
+            c.build = {"version": "1.0.9", "commit": "new"}
+            c.check_update()
+            self.assertFalse(c.state()["update"]["available"])
+            c.build = {"version": "1.0.0", "commit": None}     # running from source
+            c.check_update()
+            self.assertFalse(c.state()["update"]["available"])
+
+    def test_source_checkout_cannot_replace_itself(self):
+        c = app.Controller(sd=FakeSoundDevice(), prefs_file=self.tmp / "p.json", scan=False)
+        c.update_info.update(dmg_url="https://example.com/SyncAudio.dmg")
+        c._install_update()
+        self.assertEqual(c.update_info["state"], "failed")

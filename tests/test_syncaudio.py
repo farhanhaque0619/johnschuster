@@ -325,6 +325,10 @@ class FakeSoundDevice:
         {"name": "MacBook Pro Speakers", "max_input_channels": 0, "max_output_channels": 2, "default_samplerate": 48000.0},
     ]
 
+    # How each output really behaves. Bluetooth headphones buffer a lot, report
+    # their timing with jitter, and PortAudio's own latency figure undersells it.
+    PROFILES = {"Farhan’s AirPods Pro": {"lead": 0.25, "frames": 1024, "jitter": 0.008}}
+
     def __init__(self):
         self.default = types.SimpleNamespace(device=[0, 0])     # output already on BlackHole
         self.outputs = []
@@ -351,6 +355,12 @@ class FakeSoundDevice:
         class OutputStream(Stream):
             def __init__(self, **kw):
                 super().__init__(**kw)
+                profile = fake.PROFILES.get(fake.DEVICES[self.device]["name"], {})
+                self.lead = profile.get("lead", self.latency)
+                self.frames = profile.get("frames", self.frames)
+                self.jitter = profile.get("jitter", 0.0)
+                self.rng = np.random.default_rng(len(fake.outputs))
+                self.dacs = []
                 fake.outputs.append(self)
 
             def run(self):
@@ -358,12 +368,20 @@ class FakeSoundDevice:
                 dac0, k = time.monotonic() + 0.05, 0
                 while not self.stop_event.is_set():
                     dac = dac0 + k * self.frames / self.rate
-                    time.sleep(max(0.0, dac - self.latency - time.monotonic()))
+                    time.sleep(max(0.0, dac - self.lead - time.monotonic()))
                     out = np.zeros((self.frames, self.channels), np.float32)
-                    t = types.SimpleNamespace(currentTime=time.monotonic() + epoch, outputBufferDacTime=dac + epoch)
+                    reported = dac + self.rng.uniform(-self.jitter, self.jitter)
+                    t = types.SimpleNamespace(currentTime=time.monotonic() + epoch, outputBufferDacTime=reported + epoch)
                     self.callback(out, self.frames, t, None)
                     self.written.append(out)
+                    self.dacs.append(dac)
                     k += 1
+
+            def gaps(self, seconds):
+                """Silent holes in the last `seconds` of a tone (what crackle is made of)."""
+                tail = np.abs(np.concatenate(self.written[-int(seconds * self.rate / self.frames):])[:, 0])
+                quiet = np.convolve(tail < 1e-4, np.ones(24), "valid") >= 24
+                return int(np.count_nonzero(np.diff(quiet.astype(int)) == 1) + quiet[0])
 
         class InputStream(Stream):
             def run(self):
@@ -416,7 +434,7 @@ class AutoDelayTest(unittest.TestCase):
         auto = sa.AutoDelay()
         self.assertIsNone(auto.update(10, {"a": {"headroom_ms": 60, "dropouts": 0}}))
         new = auto.update(11, {"a": {"headroom_ms": -219, "dropouts": 3}, "b": {"headroom_ms": 80, "dropouts": 0}})
-        self.assertAlmostEqual(new, 0.40)      # 150 ms + 219 ms late + 30 ms margin, rounded up
+        self.assertAlmostEqual(new, 0.42)      # 150 ms + 219 ms late + 50 ms margin, rounded up
         # Listeners need a few seconds to measure the new delay; old bad numbers are ignored.
         self.assertIsNone(auto.update(13, {"a": {"headroom_ms": -219, "dropouts": 5}}))
 
@@ -452,6 +470,59 @@ def wait_until(check, timeout=10.0):
             return True
         time.sleep(0.2)
     return False
+
+
+class BluetoothAudioTest(unittest.TestCase):
+    """AirPods-like outputs: 250 ms of buffering and jittery timing reports."""
+
+    quiet = staticmethod(lambda *a: None)
+
+    def watch(self, player_state, seconds=6.0):
+        """Sample the sync state; return the share of time shown as in sync."""
+        states = []
+        for _ in range(int(seconds / 0.1)):
+            states.append(player_state())
+            time.sleep(0.1)
+        return sum(s == "in_sync" for s in states) / len(states)
+
+    def test_sharing_mac_on_airpods_plays_cleanly(self):
+        sd = FakeSoundDevice()
+        sd.DEVICES = sd.DEVICES + [AirPodsTest.AIRPODS]
+        with mock.patch.object(sa.shutil, "which", return_value=None):
+            host = sa.HostSession(sd, "Den", port=free_port(), output_query="AirPods", log=self.quiet).start()
+        try:
+            self.assertTrue(wait_until(lambda: host.info()["local"]["state"] == "in_sync", 15), host.info())
+            time.sleep(2)
+            resyncs = host.host.local.resyncs
+            steady = self.watch(lambda: host.info()["local"]["state"])
+            # The flicker people saw was ~50% of the time; allow a blip from this shared machine stalling.
+            self.assertGreaterEqual(steady, 0.95, f"status stays on In sync: {host.info()}")
+            # Crackle is a steady stream of holes; allow one for this shared machine pausing a thread.
+            self.assertLessEqual(sd.outputs[-1].gaps(5), 1, "no crackle: the tone has no holes")
+            self.assertEqual(host.host.local.resyncs, resyncs, "no jumps once settled")
+            self.assertGreaterEqual(host.info()["delay_ms"], 260, "delay grew to cover the AirPods")
+        finally:
+            host.stop()
+
+    def test_listener_on_airpods_plays_cleanly(self):
+        port = free_port()
+        with mock.patch.object(sa.shutil, "which", return_value=None):
+            host = sa.HostSession(FakeSoundDevice(), "Den", port=port, log=self.quiet).start()
+        sd = FakeSoundDevice()
+        sd.DEVICES = sd.DEVICES + [AirPodsTest.AIRPODS]
+        join = sa.JoinSession(sd, "127.0.0.1", "Sam", output_query="AirPods", port=port, log=self.quiet).start()
+        try:
+            self.assertTrue(wait_until(lambda: join.info()["state"] == "in_sync", 20), join.info())
+            time.sleep(2)
+            resyncs = join.client.player.resyncs
+            steady = self.watch(lambda: join.info()["state"])
+            self.assertGreaterEqual(steady, 0.95, f"status stays on In sync: {join.info()}")
+            # Crackle is a steady stream of holes; allow one for this shared machine pausing a thread.
+            self.assertLessEqual(sd.outputs[-1].gaps(5), 1, "no crackle: the tone has no holes")
+            self.assertEqual(join.client.player.resyncs, resyncs, "no jumps once settled")
+        finally:
+            join.stop()
+            host.stop()
 
 
 class AirPodsTest(unittest.TestCase):

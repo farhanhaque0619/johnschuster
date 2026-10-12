@@ -12,9 +12,12 @@ native window (pywebview) shows it. Without pywebview it opens in the browser.
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import http.server
 import json
+import os
+import platform
 import secrets
 import subprocess
 import sys
@@ -26,7 +29,9 @@ import webbrowser
 from collections import deque
 from pathlib import Path
 
+import discovery
 import syncaudio as sa
+import updater
 
 APP_NAME = "SyncAudio"
 VERSION = "1.0.0"
@@ -77,12 +82,19 @@ class Controller:
         self.nearby: list = []
         self.idle_since = time.monotonic()
         self.install = {"state": "idle", "message": ""}
+        self.build = updater.build_info(resource_dir(), VERSION)
+        self.update_info = {"state": "idle", "available": False, "version": None, "message": ""}
+        self.on_quit = None     # set by the window: closes the app
         self.events: deque = deque(maxlen=40)
+        self.history: deque = deque(maxlen=180)     # one sample a second, for diagnostics
+        self.scan_errors: dict = {}
+        self.probe_result = None
         self.lock = threading.RLock()
         self.running = True
         self._recover_sound_output()
         if scan:
             threading.Thread(target=self._scan_loop, daemon=True).start()
+            threading.Thread(target=self._update_loop, daemon=True).start()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -134,12 +146,88 @@ class Controller:
         self.blackhole = any("blackhole" in d["name"].lower() for d in sd.query_devices())
 
     def _scan_loop(self):
+        """While idle: ask the network who's sharing (broadcast, a chunk of the
+        subnet, remembered addresses) and listen to Bonjour, AirDrop link included."""
+        browser, sweep, sweep_ip = None, None, None
         while self.running:
+            if self.session is not None:
+                if browser:             # the AirDrop link costs Wi-Fi latency; not while playing
+                    browser.stop()
+                    browser = None
+                time.sleep(1.0)
+                continue
+            if browser is None:
+                browser = discovery.Browser().start()
+            ip = sa.lan_ip()
+            if ip != sweep_ip:
+                sweep_ip, sweep, broadcast = ip, None, None
+                iface = discovery.interface_for(ip)
+                if iface:
+                    sweep, broadcast = discovery.Sweep(ip, iface[0]), iface[1]
+            targets = {"255.255.255.255", *self.prefs.get("known_hosts", [])}
+            if sweep:
+                targets.update(sweep.next_targets())
+                targets.add(broadcast)
+            by_name, errors = {}, []      # one entry per Mac, even when several routes found it
+            replies = sa.discover_all(self.port, timeout=1.0, targets=targets, errors=errors)
+            self.scan_errors = dict(collections.Counter(errors))
+            for address, name in replies:
+                if name not in by_name or by_name[name].startswith("127."):
+                    by_name[name] = address
+            for name, address in list(browser.found.items()):
+                by_name.setdefault(name, address)
             if self.session is None:
-                found = sa.discover_all(self.port, timeout=1.0)
-                if self.session is None:
-                    self.nearby = [{"address": ip, "name": name} for ip, name in found]
-            time.sleep(2.0)
+                self.nearby = [{"address": a, "name": n} for n, a in sorted(by_name.items(), key=lambda i: i[0].lower())]
+            time.sleep(1.0)
+        if browser:
+            browser.stop()
+
+    def _remember(self, addresses):
+        """Macs we've played with: looked for directly next time."""
+        known = self.prefs.get("known_hosts", [])
+        fresh = [a for a in addresses if a and a not in known]
+        if fresh:
+            self.prefs["known_hosts"] = (fresh + known)[:10]
+            self._save_prefs()
+
+    # ------------------------------------------------------------- updates
+    def _update_loop(self):
+        time.sleep(5)
+        while self.running:
+            self.check_update()
+            time.sleep(6 * 3600)
+
+    def check_update(self):
+        """Is the published build newer than this one?"""
+        if self.update_info["state"] in ("downloading", "restarting"):
+            return
+        latest = updater.latest_release()
+        if not latest:
+            return
+        mine = self.build.get("commit")
+        available = bool(mine and latest["commit"] and latest["commit"] != mine)
+        self.update_info = {**self.update_info, "available": available, "version": latest["version"],
+                            "dmg_url": latest["dmg_url"], "checked": time.time()}
+
+    def install_update(self):
+        if self.update_info.get("dmg_url") and self.update_info["state"] not in ("downloading", "restarting"):
+            self.update_info.update(state="downloading", message="Downloading the new version…")
+            threading.Thread(target=self._install_update, daemon=True).start()
+
+    def _install_update(self):
+        try:
+            bundle = updater.current_bundle()
+            if not bundle:
+                raise RuntimeError("this copy can't update itself; download the new version instead")
+            staging = updater.staging_dir(bundle)
+            new = updater.prepare(self.update_info["dmg_url"], staging)
+            self.update_info.update(state="restarting", message="Restarting SyncAudio…")
+            updater.apply(new, bundle, staging, os.getpid())
+            time.sleep(0.5)
+            if self.on_quit:
+                self.on_quit()
+        except Exception as e:
+            self.update_info.update(state="failed", message=f"Couldn't update: {e}")
 
     # ------------------------------------------------------------- actions
     def _stop_session(self):
@@ -270,6 +358,46 @@ class Controller:
         except (OSError, subprocess.SubprocessError):
             pass
 
+    def test_connection(self, address: str):
+        address = (address or "").strip()
+        if not address:
+            return
+        self.probe_result = {"address": address, "running": True}
+        def run():
+            self.probe_result = sa.probe(address, self.port)
+        threading.Thread(target=run, daemon=True).start()
+
+    def diagnostics(self) -> str:
+        """Everything useful for working out what's wrong, as text to paste."""
+        try:
+            firewall = subprocess.run(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"],
+                                      capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            firewall = None
+        try:
+            devices = [{"name": d["name"], "in": d["max_input_channels"], "out": d["max_output_channels"]}
+                       for d in self.sd.query_devices()]
+        except Exception as e:
+            devices = str(e)
+        ip = sa.lan_ip()
+        iface = discovery.interface_for(ip)
+        report = {
+            "app": self.build, "macos": platform.mac_ver()[0], "machine": platform.machine(),
+            "network": {"ip": ip, "subnet": str(iface[0]) if iface else None, "firewall": firewall,
+                        "scan_send_errors": self.scan_errors, "known_hosts": self.prefs.get("known_hosts", []),
+                        "nearby": self.nearby, "bonjour": bool(discovery.dns_sd())},
+            "devices": devices,
+            "session": self.session.info() if self.session else None,
+            "settings": self.state()["settings"],
+            "history": list(self.history),
+            "events": list(self.events),
+            "probe": self.probe_result,
+        }
+        return json.dumps(report, indent=1, default=str)
+
+    def copy_diagnostics(self):
+        self.copy(self.diagnostics())
+
     def shutdown(self):
         self.running = False
         with self.lock:
@@ -284,13 +412,28 @@ class Controller:
                 self._fail(e)
         session = self.session
         info = session.info() if session else None
+        if info and (not self.history or time.time() - self.history[-1]["t"] >= 1):
+            sample = {"t": round(time.time(), 1), "mode": info["mode"], "delay_ms": info.get("delay_ms")}
+            if info["mode"] == "hosting":
+                sample["local"] = info["local"]
+                sample["listeners"] = [{k: l.get(k) for k in ("name", "state", "err_ms", "headroom_ms",
+                                                              "wifi_ms", "dropouts")} for l in info["listeners"]]
+            else:
+                sample.update({k: info.get(k) for k in ("connection", "state", "err_ms", "headroom_ms",
+                                                        "wifi_ms", "dropouts", "output")})
+            self.history.append(sample)
+        if info and info["mode"] == "listening" and info["connection"] == "connected":
+            self._remember([info["address"]])
+        elif info and info["mode"] == "hosting":
+            self._remember([l["ip"] for l in info["listeners"]])
         previous = getattr(getattr(session, "system", None), "previous", None)
         if isinstance(session, sa.HostSession) and previous and self.prefs.get("restore_output") != previous:
             self.prefs["restore_output"] = previous
             self._save_prefs()
         s = self.settings
         return {
-            "app": {"name": APP_NAME, "version": VERSION, "download_url": DOWNLOAD_URL},
+            "app": {"name": APP_NAME, "version": self.build.get("version") or VERSION, "download_url": DOWNLOAD_URL},
+            "update": {k: v for k, v in self.update_info.items() if k != "dmg_url"},
             "name": self.name,
             "address": sa.lan_ip(),
             "mode": info["mode"] if info else "idle",
@@ -304,6 +447,8 @@ class Controller:
             "settings": {"volume": s.volume, "offset_ms": s.offset_ms, "channel": s.channel,
                          "delay_ms": self.prefs.get("delay_ms"), "play_local": self.prefs.get("play_local", True)},
             "events": list(self.events)[-6:],
+            "probe": self.probe_result,
+            "scan_blocked": self.scan_errors.get(65, 0) > 0,     # EHOSTUNREACH: Local Network permission
         }
 
 
@@ -367,6 +512,10 @@ def make_server(controller: Controller, port: int = 0) -> http.server.ThreadingH
                 "/api/open": lambda: controller.open(str(data.get("what"))),
                 "/api/copy": lambda: controller.copy(str(data.get("text", ""))),
                 "/api/dismiss": lambda: setattr(controller, "error", None),
+                "/api/check-update": controller.check_update,
+                "/api/test-connection": lambda: controller.test_connection(str(data.get("address", ""))),
+                "/api/copy-diagnostics": controller.copy_diagnostics,
+                "/api/install-update": controller.install_update,
             }
             action = actions.get(self.path)
             if not action:
@@ -417,9 +566,31 @@ def main(argv=None):
     ap.add_argument("--browser", action="store_true", help="open in the browser instead of a window")
     ap.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--check-update", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--apply-update", metavar="DMG", help=argparse.SUPPRESS)
+    ap.add_argument("--no-relaunch", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--probe", metavar="ADDRESS", help="test the connection to a sharing Mac")
+    ap.add_argument("--port", type=int, default=sa.PORT, help=argparse.SUPPRESS)
+    ap.add_argument("--cli", nargs=argparse.REMAINDER, help="run the Terminal version (e.g. --cli host --click)")
     args, _ = ap.parse_known_args(argv)     # Finder may add its own arguments
+    if args.cli is not None:
+        return sa.main(args.cli)
+    if args.probe:
+        result = sa.probe(args.probe, args.port)
+        print(json.dumps(result, indent=1))
+        sys.exit(0 if result["ok"] else 1)
     if args.self_test:
         sys.exit(self_test())
+    if args.check_update:   # used by the build to test the real thing
+        print(json.dumps({"this": updater.build_info(resource_dir(), VERSION), "latest": updater.latest_release()}))
+        return
+    if args.apply_update:
+        bundle = updater.current_bundle()
+        staging = updater.staging_dir(bundle)
+        new = updater.prepare(args.apply_update, staging)
+        updater.apply(new, bundle, staging, os.getpid(), relaunch=not args.no_relaunch)
+        print("update staged; swapping after exit")
+        return
 
     controller = Controller()
     server = make_server(controller)
@@ -435,6 +606,7 @@ def main(argv=None):
     try:
         if webview:
             window = webview.create_window(APP_NAME, url, width=460, height=780, min_size=(400, 600))
+            controller.on_quit = window.destroy
             if args.smoke_test:     # the build opens the real window once, checks the UI drew, and quits
                 def check():
                     time.sleep(4)
