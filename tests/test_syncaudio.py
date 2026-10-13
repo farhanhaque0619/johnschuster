@@ -189,11 +189,17 @@ class BurstTest(unittest.TestCase):
         return len(times), 1 + int(np.count_nonzero(np.diff(times) > 0.005))
 
     def test_bursts_only_with_time_to_spare(self):
+        peer = sa._Peer(None, "Saifan", "10.49.64.113")
+        self.assertEqual(peer.send_gap(), 0.0, "no stats yet: every block straight away")
+        peer.stats = {"headroom_ms": 60}
+        self.assertEqual(peer.send_gap(), 0.0, "a tight listener gets every block straight away")
+        peer.stats = {"headroom_ms": 400}
+        self.assertEqual(peer.send_gap(), sa._Peer.SEND_EVERY)
+
+    def test_a_listener_with_time_to_spare_gets_bursts(self):
         blocks, bursts = self.arrivals(headroom_ms=400)
         self.assertGreater(blocks, 80)
         self.assertLess(bursts, blocks / 2.5, "about four blocks per transmission")
-        blocks, bursts = self.arrivals(headroom_ms=60)
-        self.assertGreater(bursts, blocks / 2, "a tight listener gets every block straight away")
 
 
 class StreamClockTest(unittest.TestCase):
@@ -851,7 +857,8 @@ class SessionTest(unittest.TestCase):
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 info = host.info()
-                if [l["state"] for l in info["listeners"]] == ["in_sync", "in_sync"]:
+                if [l["state"] for l in info["listeners"]] == ["in_sync", "in_sync"] and \
+                        info["local"]["state"] == "in_sync":
                     break
                 time.sleep(0.25)
             self.assertEqual([(l["name"], l["state"]) for l in info["listeners"]],

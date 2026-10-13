@@ -627,6 +627,10 @@ class _Peer:
                 except queue.Empty:
                     pass
 
+    def send_gap(self) -> float:
+        """How long to gather audio before the next transmission."""
+        return self.SEND_EVERY if (self.stats.get("headroom_ms") or 0) > self.BURST_SPARE else 0.0
+
     def take(self, now: float, timeout: float = 0.5) -> bytes:
         """Everything queued, minus audio that would reach the speaker too late.
         Sending that would only build a backlog, and the listener would fall
@@ -809,8 +813,7 @@ class Host:
             threading.Thread(target=self._read_stats, args=(peer,), daemon=True).start()
             sent = 0.0
             while self.running and peer.alive:
-                if (peer.stats.get("headroom_ms") or 0) > peer.BURST_SPARE:
-                    time.sleep(max(0.0, sent + peer.SEND_EVERY - time.monotonic()))
+                time.sleep(max(0.0, sent + peer.send_gap() - time.monotonic()))
                 try:
                     data = peer.take(self.now())
                 except queue.Empty:
