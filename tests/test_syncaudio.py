@@ -5,6 +5,7 @@
 import contextlib
 import heapq
 import io
+import json
 import os
 import socket
 import sys
@@ -160,6 +161,39 @@ class PlayerSimulationTest(unittest.TestCase):
         # Timing never slips: the gap is played as silence, not by falling behind.
         self.assert_tight(errs["friend"], 10, 0.0015, "friend")
         self.assertEqual(players["friend"].resyncs, 0)
+
+
+class BurstTest(unittest.TestCase):
+    """Fewer Wi-Fi transmissions when there's time to spare (Bluetooth shares the radio)."""
+
+    def arrivals(self, headroom_ms):
+        port = free_port()
+        host = sa.Host(RATE, 2, 0.5, port, "Farhan", log=lambda *a: None)
+        host.start()
+        clicks = sa.ClickSource(RATE, 2, host.on_block)
+        sock = socket.create_connection(("127.0.0.1", port))
+        try:
+            sock.sendall(sa.frame(sa.HELLO, json.dumps({"magic": sa.MAGIC, "name": "Saifan"}).encode()))
+            self.assertEqual(sa.recv_frame(sock)[0], sa.HEADER)
+            sock.sendall(sa.frame(sa.STATS, json.dumps({"headroom_ms": headroom_ms}).encode()))
+            clicks.start()
+            times, end = [], time.monotonic() + 2.0
+            while time.monotonic() < end:
+                if sa.recv_frame(sock)[0] == sa.AUDIO:
+                    times.append(time.monotonic())
+        finally:
+            clicks.close()
+            sock.close()
+            host.stop()
+        times = np.array(times[50:])              # after the stats arrived
+        return len(times), 1 + int(np.count_nonzero(np.diff(times) > 0.005))
+
+    def test_bursts_only_with_time_to_spare(self):
+        blocks, bursts = self.arrivals(headroom_ms=400)
+        self.assertGreater(blocks, 80)
+        self.assertLess(bursts, blocks / 2.5, "about four blocks per transmission")
+        blocks, bursts = self.arrivals(headroom_ms=60)
+        self.assertGreater(bursts, blocks / 2, "a tight listener gets every block straight away")
 
 
 class StreamClockTest(unittest.TestCase):

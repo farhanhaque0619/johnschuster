@@ -599,7 +599,9 @@ class SoundDeviceInput:
 class _Peer:
     QUEUE = 300     # blocks waiting to be sent (3 s at 10 ms blocks)
     SEND_EVERY = 0.04       # send in 40 ms bursts, not a packet every 10 ms: Wi-Fi shares its
-                            # radio with Bluetooth headphones, and fewer, fuller bursts leave it free
+                            # radio with Bluetooth headphones, and fewer, fuller bursts leave it free.
+    BURST_SPARE = 200       # ...but only to a listener with this many ms of audio to spare
+                            # (AirPods listeners have plenty); a tight one gets every block at once
     SNDBUF = 64 * 1024      # the kernel's share of the backlog: ~1/3 s of audio
 
     def __init__(self, sock: socket.socket, name: str, ip: str):
@@ -807,7 +809,8 @@ class Host:
             threading.Thread(target=self._read_stats, args=(peer,), daemon=True).start()
             sent = 0.0
             while self.running and peer.alive:
-                time.sleep(max(0.0, sent + peer.SEND_EVERY - time.monotonic()))
+                if (peer.stats.get("headroom_ms") or 0) > peer.BURST_SPARE:
+                    time.sleep(max(0.0, sent + peer.SEND_EVERY - time.monotonic()))
                 try:
                     data = peer.take(self.now())
                 except queue.Empty:
