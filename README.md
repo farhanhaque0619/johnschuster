@@ -120,9 +120,11 @@ going, so everyone else still hears it.
   `sudo ifconfig awdl0 down` in Terminal on each Mac turns that off until restart,
   which often fixes repeated dropouts. It also stops Macs finding each other over
   the AirDrop link, so you may need to type the address.
-* **Static, or "Getting in sync" over and over, especially on AirPods.** Update to 1.1.2
-  or newer: older versions timed audio by when the app got round to it, which a busy
-  Mac does late.
+* **Static, or "Getting in sync" over and over, especially on AirPods.** Update to 1.1.3
+  or newer. Some AirPods play slightly slower than they should (we've seen 1.3 %);
+  SyncAudio now measures each output's real speed and matches it (Copy diagnostics shows
+  it as "speed"). Older versions also timed audio by when the app got round to it,
+  which a busy Mac does late.
 * **Plays fine for a minute or two, then breaks up and drops.** Update to 1.1.1 or
   newer. Older versions let a listener fall further and further behind when the Wi-Fi
   couldn't keep up, and macOS slowed the app down once its window was hidden.
