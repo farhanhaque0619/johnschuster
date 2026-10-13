@@ -122,8 +122,7 @@ going, so everyone else still hears it.
   the AirDrop link, so you may need to type the address.
 * **Static on Bluetooth headphones (AirPods, Beats).** A Mac's Wi-Fi and Bluetooth
   share one radio, so a busy Wi-Fi connection makes Bluetooth headphones drop audio.
-  Since 1.1.4 SyncAudio compresses the stream to a tenth of its old size and sends
-  it in fewer bursts. If it still happens, check which Wi-Fi band the Mac is on:
+  Since 1.1.4 SyncAudio compresses the stream to about a fifteenth of its old size. If it still happens, check which Wi-Fi band the Mac is on:
   hold **Option** and click the Wi-Fi icon in the menu bar. **2.4 GHz** (channels
   1-14) is the bad one; join the 5 GHz version of the network if there is one
   (often the same name with "5G"), or sit closer to the router. Copy diagnostics

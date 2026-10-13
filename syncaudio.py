@@ -598,10 +598,6 @@ class SoundDeviceInput:
 # --------------------------------------------------------------------- host
 class _Peer:
     QUEUE = 300     # blocks waiting to be sent (3 s at 10 ms blocks)
-    SEND_EVERY = 0.04       # send in 40 ms bursts, not a packet every 10 ms: Wi-Fi shares its
-                            # radio with Bluetooth headphones, and fewer, fuller bursts leave it free.
-    BURST_SPARE = 200       # ...but only to a listener with this many ms of audio to spare
-                            # (AirPods listeners have plenty); a tight one gets every block at once
     SNDBUF = 64 * 1024      # the kernel's share of the backlog: ~1/3 s of audio
 
     def __init__(self, sock: socket.socket, name: str, ip: str):
@@ -626,10 +622,6 @@ class _Peer:
                         self.late += 1
                 except queue.Empty:
                     pass
-
-    def send_gap(self) -> float:
-        """How long to gather audio before the next transmission."""
-        return self.SEND_EVERY if (self.stats.get("headroom_ms") or 0) > self.BURST_SPARE else 0.0
 
     def take(self, now: float, timeout: float = 0.5) -> bytes:
         """Everything queued, minus audio that would reach the speaker too late.
@@ -811,15 +803,12 @@ class Host:
             if not peer.probe:
                 self.log(f"+ {peer.name} joined ({ip})")
             threading.Thread(target=self._read_stats, args=(peer,), daemon=True).start()
-            sent = 0.0
             while self.running and peer.alive:
-                time.sleep(max(0.0, sent + peer.send_gap() - time.monotonic()))
                 try:
                     data = peer.take(self.now())
                 except queue.Empty:
                     continue
                 if data:
-                    sent = time.monotonic()
                     sock.sendall(data)
         except (OSError, ValueError, ConnectionError):
             pass

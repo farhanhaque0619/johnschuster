@@ -32,7 +32,7 @@ jobs:
           echo "OPUS_LIB=$(realpath "$(brew --prefix opus)/lib/libopus.0.dylib")" >> "$GITHUB_ENV"
 
       - name: Run the tests on a real Mac
-        run: python -m unittest discover tests -v
+        run: python tests/run_ci.py
 
       - name: Check the BlackHole download the app uses is still there and unchanged
         run: |

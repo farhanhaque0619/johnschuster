@@ -5,7 +5,6 @@
 import contextlib
 import heapq
 import io
-import json
 import os
 import socket
 import sys
@@ -161,45 +160,6 @@ class PlayerSimulationTest(unittest.TestCase):
         # Timing never slips: the gap is played as silence, not by falling behind.
         self.assert_tight(errs["friend"], 10, 0.0015, "friend")
         self.assertEqual(players["friend"].resyncs, 0)
-
-
-class BurstTest(unittest.TestCase):
-    """Fewer Wi-Fi transmissions when there's time to spare (Bluetooth shares the radio)."""
-
-    def arrivals(self, headroom_ms):
-        port = free_port()
-        host = sa.Host(RATE, 2, 0.5, port, "Farhan", log=lambda *a: None)
-        host.start()
-        clicks = sa.ClickSource(RATE, 2, host.on_block)
-        sock = socket.create_connection(("127.0.0.1", port))
-        try:
-            sock.sendall(sa.frame(sa.HELLO, json.dumps({"magic": sa.MAGIC, "name": "Saifan"}).encode()))
-            self.assertEqual(sa.recv_frame(sock)[0], sa.HEADER)
-            sock.sendall(sa.frame(sa.STATS, json.dumps({"headroom_ms": headroom_ms}).encode()))
-            clicks.start()
-            times, end = [], time.monotonic() + 2.0
-            while time.monotonic() < end:
-                if sa.recv_frame(sock)[0] == sa.AUDIO:
-                    times.append(time.monotonic())
-        finally:
-            clicks.close()
-            sock.close()
-            host.stop()
-        times = np.array(times[50:])              # after the stats arrived
-        return len(times), 1 + int(np.count_nonzero(np.diff(times) > 0.005))
-
-    def test_bursts_only_with_time_to_spare(self):
-        peer = sa._Peer(None, "Saifan", "10.49.64.113")
-        self.assertEqual(peer.send_gap(), 0.0, "no stats yet: every block straight away")
-        peer.stats = {"headroom_ms": 60}
-        self.assertEqual(peer.send_gap(), 0.0, "a tight listener gets every block straight away")
-        peer.stats = {"headroom_ms": 400}
-        self.assertEqual(peer.send_gap(), sa._Peer.SEND_EVERY)
-
-    def test_a_listener_with_time_to_spare_gets_bursts(self):
-        blocks, bursts = self.arrivals(headroom_ms=400)
-        self.assertGreater(blocks, 80)
-        self.assertLess(bursts, blocks / 2.5, "about four blocks per transmission")
 
 
 class StreamClockTest(unittest.TestCase):
@@ -883,7 +843,7 @@ class SessionTest(unittest.TestCase):
                 self.assertEqual(state["delay_ms"], 300)
                 self.assertEqual(state["connection"], "connected")
                 self.assertEqual(state["state"], "in_sync")
-                self.assertGreater(state["headroom_ms"], 100)    # the 300 ms delay minus output buffers
+                self.assertGreater(state["headroom_ms"], 120)    # the 300 ms delay minus output buffers
             self.assertEqual(host.info()["delay_ms"], 300)
             self.assertFalse(host.info()["auto_delay"])
 
