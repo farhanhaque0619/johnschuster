@@ -34,6 +34,7 @@ from collections import deque
 
 import numpy as np
 
+import codec
 import discovery
 
 PORT = 47800                # TCP carries audio, UDP (same number) clock sync + discovery
@@ -46,6 +47,7 @@ APP_VERSION = "dev"         # the app sets its build version; exchanged so Macs 
 
 # --------------------------------------------------------------------- wire
 HELLO, HEADER, AUDIO, STATS, UPDATE, CONTROL = b"H", b"C", b"A", b"S", b"U", b"K"
+OPUS = b"O"                         # like AUDIO, but an Opus packet instead of 16-bit samples
 FRAME = struct.Struct("<cI")        # kind, payload length
 AUDIO_HDR = struct.Struct("<qd")    # index of first sample, play_at (host clock)
 PING = struct.Struct("<cId")        # b"P", seq, t1
@@ -596,6 +598,8 @@ class SoundDeviceInput:
 # --------------------------------------------------------------------- host
 class _Peer:
     QUEUE = 300     # blocks waiting to be sent (3 s at 10 ms blocks)
+    SEND_EVERY = 0.04       # send in 40 ms bursts, not a packet every 10 ms: Wi-Fi shares its
+                            # radio with Bluetooth headphones, and fewer, fuller bursts leave it free
     SNDBUF = 64 * 1024      # the kernel's share of the backlog: ~1/3 s of audio
 
     def __init__(self, sock: socket.socket, name: str, ip: str):
@@ -606,6 +610,7 @@ class _Peer:
         self.joined = time.monotonic()
         self.alive = True
         self.late = 0           # blocks skipped because the network couldn't deliver them in time
+        self.codec = "pcm"      # "opus" when both Macs can: a tenth of the Wi-Fi traffic
 
     def push(self, data: bytes, play_at: float = math.inf):
         """Queue a frame; audio carries the time it must be playing by."""
@@ -649,6 +654,7 @@ class Host:
         self.group_volume = 1.0     # everyone's volume; any Mac may change it
         self.group_volume_by = None
         self._gain = 1.0            # what was applied to the last block
+        self._encoder = None        # Opus, made when the first Mac that can decode it joins
         self.running = False
 
     def start(self):
@@ -725,10 +731,19 @@ class Host:
         with self.lock:
             peers = list(self.peers)
         if peers:
-            pcm16 = (np.clip(pcm, -1, 1) * 32767).astype("<i2").tobytes()
-            data = frame(AUDIO, AUDIO_HDR.pack(n, play_at) + pcm16)
+            data = {}
+            if any(p.codec == "pcm" for p in peers):
+                pcm16 = (np.clip(pcm, -1, 1) * 32767).astype("<i2").tobytes()
+                data["pcm"] = frame(AUDIO, AUDIO_HDR.pack(n, play_at) + pcm16)
+            if any(p.codec == "opus" for p in peers):
+                if self._encoder is None:
+                    self._encoder = codec.Encoder(self.channels)
+                packet = self._encoder.encode(pcm)
+                if packet:          # (a block of an odd size is skipped: the listener hears a gap)
+                    data["opus"] = frame(OPUS, AUDIO_HDR.pack(n, play_at) + packet)
             for p in peers:
-                p.push(data, play_at)
+                if p.codec in data:
+                    p.push(data[p.codec], play_at)
 
     def take_level(self) -> float:
         """Loudest sample since the last call (0..1)."""
@@ -739,7 +754,7 @@ class Host:
         with self.lock:
             peers = sorted((p for p in self.peers if not getattr(p, "probe", False)), key=lambda p: p.name.lower())
         return [{"state": "waiting", **p.stats, "name": p.name, "ip": p.ip, "version": p.version,
-                 "connected_s": time.monotonic() - p.joined, "late": p.late}
+                 "connected_s": time.monotonic() - p.joined, "late": p.late, "codec": p.codec}
                 for p in peers]
 
     def _udp_loop(self):
@@ -776,23 +791,29 @@ class Host:
             hello = json.loads(payload)
             if kind != HELLO or hello.get("magic") != MAGIC:
                 return
+            opus = "opus" in (hello.get("codecs") or []) and codec.available(self.rate, self.channels)
             sock.sendall(frame(HEADER, json.dumps({
                 "rate": self.rate, "channels": self.channels, "delay": self.delay,
-                "group_volume": self.group_volume, "name": self.name, "version": APP_VERSION}).encode()))
+                "group_volume": self.group_volume, "name": self.name, "version": APP_VERSION,
+                "codec": "opus" if opus else "pcm"}).encode()))
             peer = _Peer(sock, str(hello.get("name") or ip)[:40], ip)
             peer.probe = bool(hello.get("probe"))
             peer.version = hello.get("version")
+            peer.codec = "opus" if opus else "pcm"
             with self.lock:
                 self.peers.add(peer)
             if not peer.probe:
                 self.log(f"+ {peer.name} joined ({ip})")
             threading.Thread(target=self._read_stats, args=(peer,), daemon=True).start()
+            sent = 0.0
             while self.running and peer.alive:
+                time.sleep(max(0.0, sent + peer.SEND_EVERY - time.monotonic()))
                 try:
                     data = peer.take(self.now())
                 except queue.Empty:
                     continue
                 if data:
+                    sent = time.monotonic()
                     sock.sendall(data)
         except (OSError, ValueError, ConnectionError):
             pass
@@ -997,6 +1018,7 @@ class Client:
         self.output = None
         self.host_name = None
         self.host_version = None
+        self.codec = None               # how the audio arrives: "opus" or "pcm"
         self.delay = None
         self.group_volume = None
         self.group_volume_by = None
@@ -1069,8 +1091,8 @@ class Client:
         stop = threading.Event()
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.sendall(frame(HELLO, json.dumps({"magic": MAGIC, "name": self.name,
-                                                  "version": APP_VERSION}).encode()))
+            sock.sendall(frame(HELLO, json.dumps({"magic": MAGIC, "name": self.name, "version": APP_VERSION,
+                                                  "codecs": ["opus"] if codec.available() else []}).encode()))
             kind, payload = recv_frame(sock)
             if kind != HEADER:
                 raise ConnectionError("not a syncaudio host")
@@ -1080,6 +1102,8 @@ class Client:
             self.host_name = hdr.get("name", ip)
             self.delay = float(hdr.get("delay", 0))
             self.group_volume = float(hdr.get("group_volume", 1.0))
+            self.codec = hdr.get("codec", "pcm")
+            decoder = codec.Decoder(channels) if self.codec == "opus" else None
             self.clock = ClockSync()
             with self._output_lock:
                 if self.player is None or (self.player.rate, self.player.channels) != (rate, channels):
@@ -1102,6 +1126,11 @@ class Client:
                     n, play_at = AUDIO_HDR.unpack_from(payload)
                     pcm = np.frombuffer(payload, "<i2", offset=AUDIO_HDR.size)
                     self.player.feed(n, play_at, pcm.reshape(-1, channels).astype(np.float32) / 32768)
+                elif kind == OPUS and decoder:
+                    n, play_at = AUDIO_HDR.unpack_from(payload)
+                    pcm = decoder.decode(payload[AUDIO_HDR.size:])
+                    # Opus hands each block back 2.5 ms late: place it where it really belongs.
+                    self.player.feed(n - codec.DELAY, play_at - codec.DELAY / rate, pcm)
                 elif kind == UPDATE:
                     update = json.loads(payload)
                     self.delay = float(update.get("delay", self.delay))
@@ -1169,6 +1198,7 @@ class Client:
             "underflows": getattr(self.output, "underflows", 0),
             "glitches": glitches(p, self.output),
             "speed_pct": round(p.speed * 100, 2) if p else None,   # output's speed off 48 kHz-nominal
+            "codec": self.codec,
         }
 
     def status(self) -> str:

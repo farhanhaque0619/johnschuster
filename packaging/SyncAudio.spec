@@ -5,11 +5,12 @@ import os
 root = os.path.abspath(os.path.join(SPECPATH, ".."))
 version = os.environ.get("APP_VERSION", "1.0.0")
 switch = os.environ.get("SWITCHAUDIO_BIN")
+opus = os.environ.get("OPUS_LIB")      # libopus.0.dylib; the self-test fails without it
 
 a = Analysis(
     [os.path.join(root, "app.py")],
     pathex=[root],
-    binaries=[(switch, ".")] if switch else [],
+    binaries=([(switch, ".")] if switch else []) + ([(opus, ".")] if opus else []),
     datas=[(os.path.join(root, "ui"), "ui")] + (
         [(os.path.join(root, "build_info.json"), ".")] if os.path.exists(os.path.join(root, "build_info.json")) else []),
     hiddenimports=["webview.platforms.cocoa"],

@@ -36,7 +36,7 @@ import syncaudio as sa
 import updater
 
 APP_NAME = "SyncAudio"
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 DOWNLOAD_URL = "https://github.com/farhanhaque0619/johnschuster/releases/latest"
 BLACKHOLE_URL = "https://existential.audio/downloads/BlackHole2ch-0.7.1.pkg"
 BLACKHOLE_SHA256 = "57b540f27a3e29c37e310e01bee0fdfab76733087e47f997ef9dccf851400dcf"
@@ -94,6 +94,44 @@ def bundled_switch_tool() -> str | None:
 
 def default_prefs_file() -> Path:
     return Path.home() / "Library" / "Application Support" / APP_NAME / "prefs.json"
+
+
+def wifi_info(text: str | None = None) -> dict | None:
+    """The Wi-Fi network this Mac is on: channel, band, signal. On 2.4 GHz, Wi-Fi and
+    Bluetooth headphones fight over the same radio, which sounds like static."""
+    if text is None:
+        try:
+            text = subprocess.run(["system_profiler", "SPAirPortDataType", "-json"], capture_output=True,
+                                  text=True, timeout=15).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+
+    def find(node):
+        if isinstance(node, dict):
+            if isinstance(node.get("spairport_current_network_information"), dict):
+                return node["spairport_current_network_information"]
+            node = list(node.values())
+        if isinstance(node, list):
+            for item in node:
+                found = find(item)
+                if found:
+                    return found
+        return None
+
+    net = find(data)
+    if not net:
+        return None
+    channel = str(net.get("spairport_network_channel", ""))
+    m = re.search(r"\b(2|5|6)\s*GHz", channel)
+    number = re.match(r"\s*(\d+)", channel)
+    band = f"{'2.4' if m.group(1) == '2' else m.group(1)} GHz" if m else (
+        "2.4 GHz" if number and int(number.group(1)) <= 14 else None)
+    return {"channel": channel or None, "band": band, "phy": net.get("spairport_network_phymode"),
+            "signal": net.get("spairport_signal_noise")}
 
 
 class NoNap:
@@ -601,7 +639,8 @@ class Controller:
             "network": {"ip": ip, "subnet": str(iface[0]) if iface else None, "firewall": firewall,
                         "firewall_app": self.firewall(),
                         "scan_send_errors": self.scan_errors, "known_hosts": self.prefs.get("known_hosts", []),
-                        "nearby": self.nearby, "bonjour": bool(discovery.dns_sd())},
+                        "nearby": self.nearby, "bonjour": bool(discovery.dns_sd()),
+                        "wifi": wifi_info() if sys.platform == "darwin" else None},
             "devices": devices,
             "session": self.session.info() if self.session else None,
             "room": self.room.status() if self.room else None,
@@ -618,7 +657,9 @@ class Controller:
         lines = [f"SyncAudio {report['app'].get('version')} ({(report['app'].get('commit') or 'dev')[:7]}) "
                  f"macOS {report['macos']}",
                  f"network {report['network']['ip']} {report['network']['subnet']} "
-                 f"firewall {'on' if (report['network'].get('firewall_app') or {}).get('enabled') else 'off'}",
+                 f"firewall {'on' if (report['network'].get('firewall_app') or {}).get('enabled') else 'off'} "
+                 f"wifi {(report['network'].get('wifi') or {}).get('channel')} "
+                 f"{(report['network'].get('wifi') or {}).get('signal')}",
                  f"mode {s.get('mode', 'idle')} delay {s.get('delay_ms')} ms output {s.get('output')}"]
         if s.get("mode") == "hosting":
             lines.append(f"capture glitches {s.get('capture_glitches')} level {s.get('level')} silent {s.get('silent_s')} s")
@@ -626,11 +667,13 @@ class Controller:
             lines += [f"listener {l.get('name')}: {l.get('state')} err {l.get('err_ms')} wifi {l.get('wifi_ms')} "
                       f"headroom {l.get('headroom_ms')} dropouts {l.get('dropouts')} resyncs {l.get('resyncs')} "
                       f"underflows {l.get('underflows')} late {l.get('late')} speed {l.get('speed_pct')}% "
+                      f"{l.get('codec')} "
                       f"v{l.get('version')}" for l in s.get("listeners", [])]
         elif s:
             lines.append(f"listening to {s.get('host_name')} v{s.get('host_version')}: {s.get('state')} err {s.get('err_ms')} "
                          f"wifi {s.get('wifi_ms')} headroom {s.get('headroom_ms')} dropouts {s.get('dropouts')} "
                          f"resyncs {s.get('resyncs')} underflows {s.get('underflows')} speed {s.get('speed_pct')}% "
+                         f"{s.get('codec')} "
                          f"silent {s.get('incoming_silent_s')}")
         history = report.get("history", [])[-30:]
         if history:
@@ -816,6 +859,10 @@ def self_test() -> int:
         print("pywebview missing:", e)
         return 1
     print("SwitchAudioSource:", bundled_switch_tool() or "not bundled")
+    print("Opus:", sa.codec.LIBRARY or "missing")
+    if getattr(sys, "frozen", False) and not sa.codec.available():
+        print("Opus is missing from the app: listeners would get uncompressed audio")
+        return 1
     with tempfile.TemporaryDirectory() as tmp:
         controller = Controller(sd=sounddevice, prefs_file=Path(tmp) / "prefs.json", scan=False)
         server = make_server(controller)

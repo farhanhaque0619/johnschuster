@@ -120,6 +120,14 @@ going, so everyone else still hears it.
   `sudo ifconfig awdl0 down` in Terminal on each Mac turns that off until restart,
   which often fixes repeated dropouts. It also stops Macs finding each other over
   the AirDrop link, so you may need to type the address.
+* **Static on Bluetooth headphones (AirPods, Beats).** A Mac's Wi-Fi and Bluetooth
+  share one radio, so a busy Wi-Fi connection makes Bluetooth headphones drop audio.
+  Since 1.1.4 SyncAudio compresses the stream to a tenth of its old size and sends
+  it in fewer bursts. If it still happens, check which Wi-Fi band the Mac is on:
+  hold **Option** and click the Wi-Fi icon in the menu bar. **2.4 GHz** (channels
+  1-14) is the bad one; join the 5 GHz version of the network if there is one
+  (often the same name with "5G"), or sit closer to the router. Copy diagnostics
+  shows the channel too.
 * **Static, or "Getting in sync" over and over, especially on AirPods.** Update to 1.1.3
   or newer. Some AirPods play slightly slower than they should (we've seen 1.3 %);
   SyncAudio now measures each output's real speed and matches it (Copy diagnostics shows
@@ -137,8 +145,9 @@ going, so everyone else still hears it.
 
 ## How it works
 
-The sharing Mac captures its audio through BlackHole and stamps every 5 ms
-block with the exact moment it should come out of the speakers. Every Mac,
+The sharing Mac captures its audio through BlackHole and stamps every 10 ms
+block with the exact moment it should come out of the speakers, compressed with
+Opus (about 100 kbit/s instead of 1.5 Mbit/s). Every Mac,
 including the sharing one, holds each block until that moment. The Macs
 match clocks by pinging each other constantly and trusting only the fastest
 round trips. Each Mac also corrects for its own speaker's delay as reported

@@ -27,6 +27,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r packaging/requirements-build.txt
+          # Opus compresses the stream to a tenth (Wi-Fi shares its radio with Bluetooth headphones).
+          brew install opus
+          echo "OPUS_LIB=$(realpath "$(brew --prefix opus)/lib/libopus.0.dylib")" >> "$GITHUB_ENV"
 
       - name: Run the tests on a real Mac
         run: python -m unittest discover tests -v

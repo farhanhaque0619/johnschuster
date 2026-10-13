@@ -319,6 +319,14 @@ class FakeSpeaker:
 
 class EndToEndTest(unittest.TestCase):
     def test_host_and_friend_click_together(self):
+        """Compressed with Opus (when this machine has libopus) and as plain samples."""
+        codecs = (["opus"] if sa.codec.available() else []) + ["pcm"]
+        for name in codecs:
+            with self.subTest(codec=name), \
+                    mock.patch.object(sa.codec, "available", side_effect=lambda *a: name == "opus"):
+                self.click_together(name)
+
+    def click_together(self, codec_name):
         port, delay = free_port(), 0.12
         quiet = lambda *a: None
         host = sa.Host(RATE, 2, delay, port, "test-host", log=quiet)
@@ -348,6 +356,7 @@ class EndToEndTest(unittest.TestCase):
             host.stop()
 
         self.assertEqual([(l["name"], l["state"]) for l in listeners], [("test-friend", "in_sync")])
+        self.assertEqual(listeners[0]["codec"], codec_name)
         self.assertEqual(client.state, "playing")
         h, f = host_speaker.onsets(), speakers[0].onsets()
         cutoff = host.timeline.t0 + 5        # give clock sync a few seconds
@@ -359,9 +368,9 @@ class EndToEndTest(unittest.TestCase):
         self.assertLess(np.abs(h - intended).max(), 0.001)
         # ...and out of the friend's speaker at the same moment.
         diffs = np.array([f[np.argmin(np.abs(f - t))] - t for t in h])
-        print(f"\n  end-to-end host vs friend: median {np.median(np.abs(diffs)) * 1000:.2f} ms, "
+        print(f"\n  end-to-end host vs friend ({codec_name}): median {np.median(np.abs(diffs)) * 1000:.2f} ms, "
               f"worst {np.abs(diffs).max() * 1000:.2f} ms")
-        self.assertLess(np.abs(diffs).max(), 0.002)
+        self.assertLess(np.abs(diffs).max(), 0.0012)     # Opus's own 2.5 ms delay must be taken out
 
     def test_discovery(self):
         port = free_port()
