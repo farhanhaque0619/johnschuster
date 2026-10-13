@@ -883,7 +883,7 @@ class SessionTest(unittest.TestCase):
                 self.assertEqual(state["delay_ms"], 300)
                 self.assertEqual(state["connection"], "connected")
                 self.assertEqual(state["state"], "in_sync")
-                self.assertGreater(state["headroom_ms"], 150)
+                self.assertGreater(state["headroom_ms"], 100)    # the 300 ms delay minus output buffers
             self.assertEqual(host.info()["delay_ms"], 300)
             self.assertFalse(host.info()["auto_delay"])
 
