@@ -83,6 +83,23 @@ class RememberedMacsTest(unittest.TestCase):
 
 @unittest.skipUnless(discovery.dns_sd(), "needs macOS's dns-sd")
 class BonjourRoundTripTest(unittest.TestCase):
+    def setUp(self):
+        """This tests SyncAudio's use of Bonjour, so first check the Mac's own Bonjour
+        works at all (a CI machine's sometimes doesn't): Apple's dns-sd finding itself."""
+        import subprocess
+        name = f"SyncAudio check {uuid.uuid4().hex[:6]}"
+        reg = subprocess.Popen([discovery.dns_sd(), "-R", name, "_syncaudiocheck._tcp", "local", "47998"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            out = subprocess.run([discovery.dns_sd(), "-B", "_syncaudiocheck._tcp", "local"],
+                                 capture_output=True, text=True, timeout=8).stdout
+        except subprocess.TimeoutExpired as e:
+            out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        finally:
+            reg.terminate()
+        if name not in out:
+            self.skipTest("this Mac's Bonjour doesn't see its own announcements (dns-sd alone fails)")
+
     def test_a_sharing_mac_announces_its_address(self):
         name = f"SyncAudio test {uuid.uuid4().hex[:6]}"
         ad = discovery.Advertiser(name, 47999, sa.lan_ip()).start()

@@ -641,6 +641,14 @@ class BluetoothAudioTest(unittest.TestCase):
             time.sleep(0.1)
         return sum(s == "in_sync" for s in states) / len(states)
 
+    def settled(self, info):
+        """Auto delay first grows to cover the AirPods; wait until it has stopped changing."""
+        end, delay, since = time.monotonic() + 30, None, time.monotonic()
+        while time.monotonic() < end and time.monotonic() - since < 7:
+            if info()["delay_ms"] != delay:
+                delay, since = info()["delay_ms"], time.monotonic()
+            time.sleep(0.2)
+
     def test_sharing_mac_on_airpods_plays_cleanly(self):
         sd = FakeSoundDevice()
         sd.DEVICES = sd.DEVICES + [AirPodsTest.AIRPODS]
@@ -727,13 +735,21 @@ class BluetoothAudioTest(unittest.TestCase):
         join = sa.JoinSession(sd, "127.0.0.1", "Sam", output_query="AirPods", port=port, log=self.quiet).start()
         try:
             self.assertTrue(wait_until(lambda: join.info()["state"] == "in_sync", 20), join.info())
-            time.sleep(2)
-            resyncs = join.client.player.resyncs
-            steady = self.watch(lambda: join.info()["state"])
+            self.settled(join.info)
+            resyncs, delays = join.client.player.resyncs, [join.info()["delay_ms"]]
+
+            def sample():
+                info = join.info()
+                if info["delay_ms"] != delays[-1]:
+                    delays.append(info["delay_ms"])
+                return info["state"]
+            steady = self.watch(sample)
             self.assertGreaterEqual(steady, 0.95, f"status stays on In sync: {join.info()}")
             # Crackle is a steady stream of holes; allow one for this shared machine pausing a thread.
             self.assertLessEqual(sd.outputs[-1].gaps(5), 1, "no crackle: the tone has no holes")
-            self.assertEqual(join.client.player.resyncs, resyncs, "no jumps once settled")
+            # A delay change is one deliberate jump (the delay grows to fit the AirPods).
+            self.assertLessEqual(join.client.player.resyncs - resyncs, len(delays) - 1,
+                                 f"no jumps once settled: delays {delays}")
         finally:
             join.stop()
             host.stop()
