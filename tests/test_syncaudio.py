@@ -263,7 +263,28 @@ class PlayerTest(unittest.TestCase):
         for _ in range(5):                      # but a lasting change (output restarted) is followed
             t += 0.01
             p.render(480, t + 0.08)
-        self.assertEqual(p.resyncs, 1)
+        self.assertEqual(p.resyncs + p.skips, 1)
+
+    def test_skipped_buffers_are_stepped_over_not_lost_in_the_count(self):
+        """When macOS skips playing a buffer (it asked too late, an overload), its time still
+        passes. The player must step over that sound, or everything after it plays late -
+        Saifan's AirPods ended up half a second behind while showing "in sync" (1.1.6)."""
+        p = sa.Player(RATE, 2, lambda t: t)
+        fed = 0
+        frames, dac, worst = 2048, 10.5, 0.0
+        for k in range(300):
+            while fed < (dac - 9.5) * RATE:     # sample n is due at 10 + n / RATE
+                p.feed(fed, 10.0 + fed / RATE, np.arange(fed, fed + 480, dtype=np.float32)[:, None].repeat(2, 1))
+                fed += 480
+            if k % 50 == 25:
+                dac += frames / RATE            # macOS skipped this buffer entirely
+            out = p.render(frames, dac)
+            if k > 30 and k % 50 != 25:         # (the one right after a skip is believed a buffer later)
+                worst = max(worst, abs(out[0, 0] / RATE - (dac - 10.0)))
+            dac += frames / RATE
+        self.assertEqual(p.skips, 6)
+        self.assertEqual(p.resyncs, 0, "a skip is not a jump on top of it")
+        self.assertLess(worst, 0.003, "still plays each sample at its time")
 
     def test_channel_modes_and_volume(self):
         settings = sa.Settings()
@@ -475,7 +496,8 @@ class FakeSoundDevice:
                 super().__init__(**kw)
                 profile = fake.PROFILES.get(fake.DEVICES[self.device]["name"], {})
                 self.lead = profile.get("lead", self.latency)
-                self.frames = profile.get("frames", self.frames)
+                if not kw.get("blocksize"):     # macOS's own choice when the app doesn't ask
+                    self.frames = profile.get("frames", self.frames)
                 self.jitter = profile.get("jitter", 0.0)
                 self.late = profile.get("late", 0.0)
                 self.slide = profile.get("slide", 0.0)     # reports wander this far (s) from the truth

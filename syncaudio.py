@@ -42,6 +42,11 @@ MAGIC = "syncaudio/1"
 BLOCK_MS = 10               # capture block size
 OUTPUT_LATENCY = 0.1        # CoreAudio output buffer: roomy, so a busy moment in Python can't click;
                             # it's compensated, so it only adds to the delay
+# ...but PortAudio subtracts the device's own latency from OUTPUT_LATENCY to size the buffer. AirPods
+# report ~160 ms, so the buffer collapsed to the device minimum (about 1 ms): Python had to answer within
+# 1 ms, often didn't, and macOS skipped that bit of sound - Saifan's static. So ask for the size directly
+# (2048 frames = 43 ms). SYNCAUDIO_OUTPUT_BLOCK=0 restores the old behaviour, for comparison.
+OUTPUT_BLOCK = int(os.environ.get("SYNCAUDIO_OUTPUT_BLOCK", "2048"))
 INPUT_LATENCY = 0.05        # same for capturing from BlackHole
 APP_VERSION = "dev"         # the app sets its build version; exchanged so Macs can spot mismatches
 
@@ -199,6 +204,7 @@ class Player:
             self.acc = 0.0
             self.err = 0.0                      # filtered timing error, seconds (+ = early)
             self.starving = False
+            self._overrun = False
             self.synced = False
             self.locked = False                 # has been in sync since the last jump
             self.dropouts = 0
@@ -209,6 +215,9 @@ class Player:
             self._dac_frames = 0
             self._gap = 0.0                     # last ordinary report minus the sample count
             self._dac_odd = 0                   # buffers in a row whose reported time made no sense
+            self.skips = 0                      # times macOS skipped playing part of the sound
+            self.skipped = 0.0                  # ...and how much, seconds
+            self._skip_frames = 0               # skipped sound the read position still has to step over
 
     def feed(self, n: int, play_at: float, pcm: np.ndarray) -> None:
         k = len(pcm)
@@ -241,6 +250,10 @@ class Player:
             # and over, is what crackle and "static" are made of.
             return out
         lo = max(start, self.n_first, self.n_end - self.cap)
+        overrun = lo > start >= self.n_first     # so far behind that the audio was already overwritten
+        if overrun and not self._overrun:
+            self.dropouts += 1
+        self._overrun = overrun
         hi = start + need
         if hi > lo:
             i, m = lo % self.cap, hi - lo
@@ -257,11 +270,24 @@ class Player:
             return dac
         counted = self._dac + self._dac_frames / self.rate
         gap = dac - counted
-        if abs(gap - self._gap) > self.JUMP:
+        step = gap - self._gap
+        skip = max(0.008, 0.5 * self._dac_frames / self.rate)
+        if abs(step) > 0.5:                 # the output restarted: line up afresh
+            counted, self._gap, self._dac_odd = dac, 0.0, 0
+        elif step > skip:
+            # Later than the samples say, by more than half a buffer: macOS skipped playing some
+            # (an overload). That time is gone; follow it, or playback falls behind for good.
+            self._dac_odd += 1
+            if self._dac_odd >= 2:
+                self.skips += 1
+                self.skipped += step
+                self._skip_frames += int(round(step * self.rate))
+                counted, self._gap, self._dac_odd = dac, 0.0, 0
+        elif abs(step) > self.JUMP:
             # A sudden step. AirPods now and then report one wild time (reacting to it
             # would be a click); a step that lasts means the output really jumped or restarted.
             self._dac_odd += 1
-            if self._dac_odd >= 3 or abs(gap - self._gap) > 0.5:
+            if self._dac_odd >= 3:
                 counted, self._gap, self._dac_odd = dac, 0.0, 0
         else:
             self._dac_odd = 0
@@ -286,6 +312,10 @@ class Player:
             if shift and self._dac is not None:
                 self._dac += shift
             server_t = self.to_server(self._smooth_dac(dac_local, frames))
+            if self._skip_frames:
+                if self.read_n is not None:     # that sound was never played: step over it, in sync
+                    self.read_n += self._skip_frames
+                self._skip_frames = 0
             if server_t is None or self.anchor is None:
                 self.read_n = None
                 self.synced = False
@@ -519,6 +549,7 @@ class SoundDeviceOutput:
         self.name = info["name"]
         self.channels = min(2, info["max_output_channels"])
         self.underflows = 0         # macOS ran out of audio to play: a click
+        self.io_frames = [0, 0]     # smallest and largest buffer macOS asked for (the time Python has to answer)
         clock = StreamClock(now)
         good = []                   # the last sensible lead time
         mapped = []                 # the clock offset used for the last buffer
@@ -527,6 +558,11 @@ class SoundDeviceOutput:
         def callback(outdata, frames, t, status):
             if status and status.output_underflow:
                 self.underflows += 1
+            sizes = self.io_frames
+            if not sizes[0] or frames < sizes[0]:
+                sizes[0] = frames
+            if frames > sizes[1]:
+                sizes[1] = frames
             try:
                 offset = clock.offset(t.currentTime)
                 lead = t.outputBufferDacTime - t.currentTime
@@ -544,7 +580,8 @@ class SoundDeviceOutput:
                     print(f"\nplayback error: {e!r}", file=sys.stderr)
 
         self.stream = sd.OutputStream(samplerate=rate, device=device, channels=self.channels,
-                                      dtype="float32", latency=OUTPUT_LATENCY, callback=callback)
+                                      dtype="float32", latency=OUTPUT_LATENCY, blocksize=OUTPUT_BLOCK,
+                                      callback=callback)
         self.stream.start()
         self.latency = self.stream.latency
 
@@ -1184,6 +1221,7 @@ class Client:
             "underflows": getattr(self.output, "underflows", 0),
             "glitches": glitches(p, self.output),
             "report_gap_ms": round(p._gap * 1000, 1) if p else None,   # macOS's timing report vs the samples
+            **output_info(p, self.output),
             "codec": self.codec,
         }
 
@@ -1245,14 +1283,23 @@ class SystemOutput:
 
 def glitches(p: Player | None, output=None) -> int:
     """Every audible hiccup: audio arriving late, sync jumps, macOS running short."""
-    return (p.dropouts + p.resyncs if p else 0) + getattr(output, "underflows", 0)
+    return (p.dropouts + p.resyncs + p.skips if p else 0) + getattr(output, "underflows", 0)
 
 
 def player_info(p: Player | None, output=None) -> dict:
     return {"state": player_state(p), "err_ms": round(p.err * 1000, 2) if p else None,
             "dropouts": p.dropouts if p else 0, "resyncs": p.resyncs if p else 0,
             "underflows": getattr(output, "underflows", 0), "glitches": glitches(p, output),
-            "report_gap_ms": round(p._gap * 1000, 1) if p else None}
+            "report_gap_ms": round(p._gap * 1000, 1) if p else None, **output_info(p, output)}
+
+
+def output_info(p: Player | None, output=None) -> dict:
+    """How the sound card is being driven: buffer sizes macOS uses, and sound it skipped."""
+    frames = getattr(output, "io_frames", None)
+    latency = getattr(output, "latency", None)
+    return {"io_frames": list(frames) if frames else None,
+            "stream_latency_ms": round(latency * 1000) if isinstance(latency, (int, float)) else None,
+            "skips": p.skips if p else 0, "skipped_ms": round(p.skipped * 1000, 1) if p else 0}
 
 
 class HostSession:

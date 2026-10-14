@@ -50,5 +50,18 @@ class WifiTest(unittest.TestCase):
         self.assertIsNone(app.wifi_info("not json"))
 
 
+class OverloadLogTest(unittest.TestCase):
+    def test_counts_macos_overload_lines(self):
+        log = ("Timestamp               Ty Process[PID:TID]\n"
+               "2026-10-14 03:01:02.123 E  coreaudiod[180:2b1] [com.apple.coreaudio:as_server] HALS_IOContext: "
+               "skipping cycle due to overload\n"
+               "2026-10-14 03:01:02.130 Df coreaudiod[180:2b1] something else\n"
+               "2026-10-14 03:01:03.001 E  coreaudiod[180:2b1] IOWorkLoop: Overload detected\n")
+        lines = app.coreaudio_overloads(log)
+        self.assertEqual(lines[0], "2 in the last 15 min")
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(app.coreaudio_overloads(log, limit=1)[1:], [lines[-1]])
+
+
 if __name__ == "__main__":
     unittest.main()

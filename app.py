@@ -36,7 +36,7 @@ import syncaudio as sa
 import updater
 
 APP_NAME = "SyncAudio"
-VERSION = "1.1.6"
+VERSION = "1.1.7"
 DOWNLOAD_URL = "https://github.com/farhanhaque0619/johnschuster/releases/latest"
 BLACKHOLE_URL = "https://existential.audio/downloads/BlackHole2ch-0.7.1.pkg"
 BLACKHOLE_SHA256 = "57b540f27a3e29c37e310e01bee0fdfab76733087e47f997ef9dccf851400dcf"
@@ -94,6 +94,21 @@ def bundled_switch_tool() -> str | None:
 
 def default_prefs_file() -> Path:
     return Path.home() / "Library" / "Application Support" / APP_NAME / "prefs.json"
+
+
+def coreaudio_overloads(text: str | None = None, limit: int = 50) -> list | None:
+    """macOS's own log of moments the sound system skipped audio ("overload"): the static,
+    as macOS saw it. Only read when diagnostics are copied (it takes a few seconds)."""
+    if text is None:
+        try:
+            text = subprocess.run(["log", "show", "--last", "15m", "--style", "compact", "--predicate",
+                                   'process == "coreaudiod" AND (eventMessage CONTAINS[c] "overload" '
+                                   'OR eventMessage CONTAINS[c] "skipping cycle")'],
+                                  capture_output=True, text=True, timeout=20).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+    lines = [l.strip() for l in text.splitlines() if "overload" in l.lower() or "skipping cycle" in l.lower()]
+    return [f"{len(lines)} in the last 15 min"] + lines[-limit:]
 
 
 def wifi_info(text: str | None = None) -> dict | None:
@@ -626,7 +641,12 @@ class Controller:
         except (OSError, subprocess.SubprocessError):
             firewall = None
         try:
-            devices = [{"name": d["name"], "in": d["max_input_channels"], "out": d["max_output_channels"]}
+            devices = [{"name": d["name"], "in": d["max_input_channels"], "out": d["max_output_channels"],
+                        "rate": d.get("default_samplerate"),
+                        # PortAudio's latency range: the low end is the device's own latency plus its smallest buffer
+                        "out_latency_ms": [round(d.get("default_low_output_latency", 0) * 1000, 1),
+                                           round(d.get("default_high_output_latency", 0) * 1000, 1)]
+                        if d["max_output_channels"] else None}
                        for d in self.sd.query_devices()]
         except Exception as e:
             devices = str(e)
@@ -646,6 +666,7 @@ class Controller:
             "history": list(self.history),
             "events": list(self.events),
             "probe": self.probe_result,
+            "coreaudio_overloads": coreaudio_overloads() if sys.platform == "darwin" else None,
         }
         return json.dumps(report, indent=1, default=str)
 
@@ -665,12 +686,14 @@ class Controller:
             lines += [f"listener {l.get('name')}: {l.get('state')} err {l.get('err_ms')} wifi {l.get('wifi_ms')} "
                       f"headroom {l.get('headroom_ms')} dropouts {l.get('dropouts')} resyncs {l.get('resyncs')} "
                       f"underflows {l.get('underflows')} late {l.get('late')} report-gap {l.get('report_gap_ms')} ms "
+                      f"io {l.get('io_frames')} skips {l.get('skips')} ({l.get('skipped_ms')} ms) "
                       f"{l.get('codec')} "
                       f"v{l.get('version')}" for l in s.get("listeners", [])]
         elif s:
             lines.append(f"listening to {s.get('host_name')} v{s.get('host_version')}: {s.get('state')} err {s.get('err_ms')} "
                          f"wifi {s.get('wifi_ms')} headroom {s.get('headroom_ms')} dropouts {s.get('dropouts')} "
                          f"resyncs {s.get('resyncs')} underflows {s.get('underflows')} report-gap {s.get('report_gap_ms')} ms "
+                         f"io {s.get('io_frames')} skips {s.get('skips')} ({s.get('skipped_ms')} ms) "
                          f"{s.get('codec')} "
                          f"silent {s.get('incoming_silent_s')}")
         history = report.get("history", [])[-30:]
@@ -719,11 +742,13 @@ class Controller:
             if info["mode"] == "hosting":
                 sample["local"] = info["local"]
                 sample["listeners"] = [{k: l.get(k) for k in ("name", "state", "err_ms", "headroom_ms",
-                                                              "wifi_ms", "dropouts", "report_gap_ms")}
+                                                              "wifi_ms", "dropouts", "report_gap_ms", "skips",
+                                                              "io_frames")}
                                        for l in info["listeners"]]
             else:
                 sample.update({k: info.get(k) for k in ("connection", "state", "err_ms", "headroom_ms",
-                                                        "wifi_ms", "dropouts", "output", "report_gap_ms")})
+                                                        "wifi_ms", "dropouts", "output", "report_gap_ms",
+                                                        "skips", "skipped_ms", "io_frames")})
             self.history.append(sample)
         if info and info["mode"] == "listening" and info["connection"] == "connected":
             self._remember([info["address"]])
