@@ -101,11 +101,22 @@ class BonjourRoundTripTest(unittest.TestCase):
             self.skipTest("this Mac's Bonjour doesn't see its own announcements (dns-sd alone fails)")
 
     def test_a_sharing_mac_announces_its_address(self):
+        import subprocess
+
+        def raw(*args):     # dns-sd never exits by itself: whatever it printed in 5 s
+            try:
+                return subprocess.run([discovery.dns_sd(), *args, "local"], capture_output=True, text=True,
+                                      timeout=5).stdout
+            except subprocess.TimeoutExpired as e:
+                return e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+
         name = f"SyncAudio test {uuid.uuid4().hex[:6]}"
         ad = discovery.Advertiser(name, 47999, sa.lan_ip()).start()
         browser = discovery.Browser().start()
         try:
-            self.assertTrue(wait_until(lambda: browser.found.get(name) == sa.lan_ip(), 20), browser.found)
+            if not wait_until(lambda: browser.found.get(name) == sa.lan_ip(), 20):
+                self.fail(f"found {browser.found}; what dns-sd itself prints:\n{raw('-B', discovery.SERVICE)}"
+                          f"\n{raw('-L', name, discovery.SERVICE)}")
             ad.stop()
             self.assertTrue(wait_until(lambda: name not in browser.found, 20), "gone once it stops")
         finally:
