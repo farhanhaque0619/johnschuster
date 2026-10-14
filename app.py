@@ -36,7 +36,7 @@ import syncaudio as sa
 import updater
 
 APP_NAME = "SyncAudio"
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 DOWNLOAD_URL = "https://github.com/farhanhaque0619/johnschuster/releases/latest"
 BLACKHOLE_URL = "https://existential.audio/downloads/BlackHole2ch-0.7.1.pkg"
 BLACKHOLE_SHA256 = "57b540f27a3e29c37e310e01bee0fdfab76733087e47f997ef9dccf851400dcf"
@@ -666,13 +666,13 @@ class Controller:
             lines.append(f"this Mac {s.get('local')}")
             lines += [f"listener {l.get('name')}: {l.get('state')} err {l.get('err_ms')} wifi {l.get('wifi_ms')} "
                       f"headroom {l.get('headroom_ms')} dropouts {l.get('dropouts')} resyncs {l.get('resyncs')} "
-                      f"underflows {l.get('underflows')} late {l.get('late')} speed {l.get('speed_pct')}% "
+                      f"underflows {l.get('underflows')} late {l.get('late')} report-gap {l.get('report_gap_ms')} ms "
                       f"{l.get('codec')} "
                       f"v{l.get('version')}" for l in s.get("listeners", [])]
         elif s:
             lines.append(f"listening to {s.get('host_name')} v{s.get('host_version')}: {s.get('state')} err {s.get('err_ms')} "
                          f"wifi {s.get('wifi_ms')} headroom {s.get('headroom_ms')} dropouts {s.get('dropouts')} "
-                         f"resyncs {s.get('resyncs')} underflows {s.get('underflows')} speed {s.get('speed_pct')}% "
+                         f"resyncs {s.get('resyncs')} underflows {s.get('underflows')} report-gap {s.get('report_gap_ms')} ms "
                          f"{s.get('codec')} "
                          f"silent {s.get('incoming_silent_s')}")
         history = report.get("history", [])[-30:]
@@ -721,11 +721,11 @@ class Controller:
             if info["mode"] == "hosting":
                 sample["local"] = info["local"]
                 sample["listeners"] = [{k: l.get(k) for k in ("name", "state", "err_ms", "headroom_ms",
-                                                              "wifi_ms", "dropouts", "speed_pct")}
+                                                              "wifi_ms", "dropouts", "report_gap_ms")}
                                        for l in info["listeners"]]
             else:
                 sample.update({k: info.get(k) for k in ("connection", "state", "err_ms", "headroom_ms",
-                                                        "wifi_ms", "dropouts", "output", "speed_pct")})
+                                                        "wifi_ms", "dropouts", "output", "report_gap_ms")})
             self.history.append(sample)
         if info and info["mode"] == "listening" and info["connection"] == "connected":
             self._remember([info["address"]])

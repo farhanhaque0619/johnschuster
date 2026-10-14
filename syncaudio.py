@@ -169,11 +169,16 @@ class Player:
     MAX_SKEW = 0.002        # normally never run more than 0.2 % fast or slow
     FAST_SKEW = 0.006       # up to 0.6 % to win back a bigger slip without a jump
     SMOOTH = 0.05           # error filter, per callback
-    # Some outputs play at a different speed from what they claim: Saifan's AirPods
-    # (macOS 15) play about 1.3 % slower than 48 kHz. The player learns that speed
-    # and resamples to match it, instead of falling behind and jumping every few seconds.
-    SPEED_WINDOW = 10.0     # seconds of timestamps the speed is measured over
-    MAX_SPEED = 0.03        # outputs off by more than 3 % aren't believed
+    # When each buffer reaches the ear is counted from the samples the output takes,
+    # which is exact. macOS's own report of it is only used to line up at the start,
+    # to notice real jumps, and to follow drift no bigger than a sound card's crystal.
+    # Bluetooth outputs (AirPods, Beats) report times that wander and slide by several
+    # percent while the headphones play perfectly steadily; chasing those reports made
+    # the player slip and jump back every few seconds, which is what the static was.
+    FOLLOW = 0.02           # share of the gap to the report closed per buffer
+    MAX_DRIFT = 0.0005      # ...but never more than 0.05 % (crystals are within 0.01 %)
+    TRUST = 0.02            # a report further than this from the sample count is ignored
+    JUMP = 0.05             # a sudden step this big that lasts 3 buffers is a real jump
 
     def __init__(self, rate: int, channels: int, to_server, settings: Settings | None = None,
                  buffer_s: float = 4.0):
@@ -193,7 +198,6 @@ class Player:
             self.read_n = None                  # next sample index to play
             self.acc = 0.0
             self.err = 0.0                      # filtered timing error, seconds (+ = early)
-            self.speed = 0.0                    # measured: how much faster to read than nominal
             self.starving = False
             self.synced = False
             self.locked = False                 # has been in sync since the last jump
@@ -203,8 +207,7 @@ class Player:
             self.last_sound = None                      # when a block with actual sound last arrived
             self._dac = None
             self._dac_frames = 0
-            self._played = 0                    # frames handed to the output so far
-            self._marks: deque = deque()        # (frames played, reported time) for the speed
+            self._gap = 0.0                     # last ordinary report minus the sample count
             self._dac_odd = 0                   # buffers in a row whose reported time made no sense
 
     def feed(self, n: int, play_at: float, pcm: np.ndarray) -> None:
@@ -247,51 +250,32 @@ class Player:
         return out
 
     def _smooth_dac(self, dac: float, frames: int) -> float:
-        """Buffers play back to back, so each one's start is predictable from
-        the last. Bluetooth outputs (AirPods) report it with several ms of
-        jitter, so follow the reports only slowly; jump if the device skipped."""
-        reported = dac
-        if self._dac is not None:
-            predicted = self._dac + self._dac_frames / self.rate * (1 + self.speed)  # at the output's real speed
-            if abs(dac - predicted) < 0.05:
-                dac = predicted + 0.02 * (dac - predicted)
-                self._dac_odd = 0
-            else:
-                # AirPods now and then report a wildly wrong time for one buffer. Believe a
-                # jump only when it persists; reacting to a one-off spike means a click.
-                self._dac_odd += 1
-                if self._dac_odd < 3 and abs(dac - predicted) < 0.5:   # bigger: the output restarted
-                    dac = predicted
-                    reported = None
-                else:
-                    self._dac_odd = 0
-                    self._marks.clear()         # a new timeline: measure the speed afresh
-        if reported is not None:
-            self._measure_speed(reported)
-        self._played += frames
-        self._dac, self._dac_frames = dac, frames
-        return dac
+        """When this buffer reaches the speaker: the last one's time plus its length,
+        nudged toward macOS's report only while that report is believable."""
+        if self._dac is None:
+            self._dac, self._dac_frames, self._gap, self._dac_odd = dac, frames, 0.0, 0
+            return dac
+        counted = self._dac + self._dac_frames / self.rate
+        gap = dac - counted
+        if abs(gap - self._gap) > self.JUMP:
+            # A sudden step. AirPods now and then report one wild time (reacting to it
+            # would be a click); a step that lasts means the output really jumped or restarted.
+            self._dac_odd += 1
+            if self._dac_odd >= 3 or abs(gap - self._gap) > 0.5:
+                counted, self._gap, self._dac_odd = dac, 0.0, 0
+        else:
+            self._dac_odd = 0
+            if abs(gap) < self.TRUST:
+                most = self.MAX_DRIFT * frames / self.rate
+                counted += min(most, max(-most, self.FOLLOW * gap))
+            self._gap = gap
+        self._dac, self._dac_frames = counted, frames
+        return counted
 
     def new_output(self) -> None:
-        """Playback moved to another device (AirPods in or out): its timeline and
-        speed are its own, so measure them afresh."""
+        """Playback moved to another device (AirPods in or out): line up with it afresh."""
         with self.lock:
             self._dac = None
-            self._marks.clear()
-            self.speed = 0.0
-
-    def _measure_speed(self, reported: float) -> None:
-        """How fast the output really plays: the reported times against the frames it took,
-        fitted over the last few seconds (one buffer's timestamp jitter averages out)."""
-        marks = self._marks
-        marks.append((self._played, reported))
-        while marks[-1][1] - marks[0][1] > self.SPEED_WINDOW:
-            marks.popleft()
-        if len(marks) % 25 or marks[-1][1] - marks[0][1] < 2.0:
-            return
-        f, t = np.array(marks).T
-        seconds_per_frame = np.polyfit(f - f[0], t - t[0], 1)[0]
-        self.speed = min(self.MAX_SPEED, max(-self.MAX_SPEED, seconds_per_frame * self.rate - 1))
 
     def render(self, frames: int, dac_local: float, out_channels: int = 2) -> np.ndarray:
         """Audio for `frames` frames whose first frame hits the speaker at dac_local."""
@@ -314,7 +298,7 @@ class Player:
                 self.margins.clear()
             self.err += self.SMOOTH * ((self.read_n - target) / self.rate - self.err)
             most = self.FAST_SKEW if abs(self.err) > 0.008 else self.MAX_SKEW
-            skew = self.speed + min(most, max(-most, -self.GAIN * self.err))
+            skew = min(most, max(-most, -self.GAIN * self.err))
             self.acc += skew * frames
             k = int(self.acc)
             self.acc -= k
@@ -1192,7 +1176,7 @@ class Client:
             "resyncs": p.resyncs if p else 0,
             "underflows": getattr(self.output, "underflows", 0),
             "glitches": glitches(p, self.output),
-            "speed_pct": round(p.speed * 100, 2) if p else None,   # output's speed off 48 kHz-nominal
+            "report_gap_ms": round(p._gap * 1000, 1) if p else None,   # macOS's timing report vs the samples
             "codec": self.codec,
         }
 
@@ -1261,7 +1245,7 @@ def player_info(p: Player | None, output=None) -> dict:
     return {"state": player_state(p), "err_ms": round(p.err * 1000, 2) if p else None,
             "dropouts": p.dropouts if p else 0, "resyncs": p.resyncs if p else 0,
             "underflows": getattr(output, "underflows", 0), "glitches": glitches(p, output),
-            "speed_pct": round(p.speed * 100, 2) if p else None}
+            "report_gap_ms": round(p._gap * 1000, 1) if p else None}
 
 
 class HostSession:

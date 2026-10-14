@@ -127,11 +127,10 @@ going, so everyone else still hears it.
   1-14) is the bad one; join the 5 GHz version of the network if there is one
   (often the same name with "5G"), or sit closer to the router. Copy diagnostics
   shows the channel too.
-* **Static, or "Getting in sync" over and over, especially on AirPods.** Update to 1.1.3
-  or newer. Some AirPods play slightly slower than they should (we've seen 1.3 %);
-  SyncAudio now measures each output's real speed and matches it (Copy diagnostics shows
-  it as "speed"). Older versions also timed audio by when the app got round to it,
-  which a busy Mac does late.
+* **Static, or "Getting in sync" over and over, especially on AirPods.** Update to 1.1.5
+  or newer. macOS reports Bluetooth headphones' timing with errors that slide by
+  several percent; older versions followed those reports and kept jumping to catch
+  up. SyncAudio now times playback by the audio the headphones actually take.
 * **Plays fine for a minute or two, then breaks up and drops.** Update to 1.1.1 or
   newer. Older versions let a listener fall further and further behind when the Wi-Fi
   couldn't keep up, and macOS slowed the app down once its window was hidden.

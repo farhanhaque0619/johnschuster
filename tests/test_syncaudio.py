@@ -190,17 +190,17 @@ class SlideTest(unittest.TestCase):
         self.assertEqual(players["friend"].dropouts, 0)
 
 
-class SlowOutputTest(unittest.TestCase):
-    def test_an_output_that_plays_slow_is_matched_not_chased(self):
-        """Saifan's AirPods play 1.3 % slower than 48 kHz. The player used to fall
-        behind, jump 40 ms forward and start again, every five seconds."""
-        for ppm in (-13000, 13000):
-            players, errs = simulate(seconds=40, client_dev_ppm=ppm, delay=0.4)
+class ReportSlideTest(unittest.TestCase):
+    def test_reports_that_slide_are_not_chased(self):
+        """The output plays steadily but macOS reports its timing sliding 3 % away
+        (Bluetooth): the player keeps to the samples, so no jumps and no real error."""
+        for slope in (0.03, -0.03):
+            players, errs = simulate(seconds=40, delay=0.4, wobble=lambda rng, T, k=slope: k * max(0.0, T - 0.3))
             friend = players["friend"]
-            self.assertEqual(friend.resyncs, 0, f"{ppm} ppm: no jumps")
-            self.assertAlmostEqual(friend.speed, -ppm * 1e-6, delta=0.0005)
+            self.assertEqual(friend.resyncs, 0, f"{slope}: no jumps")
+            self.assertEqual(friend.dropouts, 0)
             e = errs["friend"]
-            self.assertLess(np.abs(e[e[:, 0] > 15, 1]).max(), 0.002, f"{ppm} ppm: in sync once measured")
+            self.assertLess(np.abs(e[e[:, 0] > 5, 1]).max(), 0.003, f"{slope}: plays where it should")
 
 
 class PlayerTest(unittest.TestCase):
@@ -407,9 +407,10 @@ class FakeSoundDevice:
     # their timing with jitter, and PortAudio's own latency figure undersells it.
     PROFILES = {"Farhan’s AirPods Pro": {"lead": 0.25, "frames": 1024, "jitter": 0.008},
                 # A busier Mac: Python gets to each callback late, by an amount that wanders.
-                # ...and his AirPods really play 1.3 % slower than 48 kHz (his diagnostics).
+                # ...and macOS's timing reports for his AirPods slide away from where the audio
+                # really is by up to ~3 % (his 1.1.4 diagnostics), while they play perfectly steadily.
                 "Saifan’s AirPods Pro": {"lead": 0.25, "frames": 1024, "jitter": 0.008, "late": 0.03,
-                                          "ppm": -13000}}
+                                          "slide": 0.15}}
 
     def __init__(self):
         self.default = types.SimpleNamespace(device=[0, 0])     # output already on BlackHole
@@ -442,7 +443,7 @@ class FakeSoundDevice:
                 self.frames = profile.get("frames", self.frames)
                 self.jitter = profile.get("jitter", 0.0)
                 self.late = profile.get("late", 0.0)
-                self.speed = 1 + profile.get("ppm", 0) * 1e-6     # how fast it really plays
+                self.slide = profile.get("slide", 0.0)     # reports wander this far (s) from the truth
                 self.rng = np.random.default_rng(len(fake.outputs))
                 self.dacs = []
                 fake.outputs.append(self)
@@ -451,11 +452,12 @@ class FakeSoundDevice:
                 epoch = 1000.0          # PortAudio's clock has its own epoch
                 dac0, k = time.monotonic() + 0.05, 0
                 while not self.stop_event.is_set():
-                    dac = dac0 + k * self.frames / (self.rate * self.speed)
+                    dac = dac0 + k * self.frames / self.rate
                     asked = dac - self.lead             # when macOS asks for this buffer
                     time.sleep(max(0.0, asked - time.monotonic()))
                     out = np.zeros((self.frames, self.channels), np.float32)
-                    reported = dac + self.rng.uniform(-self.jitter, self.jitter)
+                    reported = dac + self.rng.uniform(-self.jitter, self.jitter) + \
+                        self.slide * np.sin(2 * np.pi * (dac - dac0) / 30)    # slides up to ~3 %
                     t = types.SimpleNamespace(currentTime=time.monotonic() + epoch, outputBufferDacTime=reported + epoch)
                     if self.late and self.rng.random() > 0.1:
                         # PortAudio stamped the buffer on time; Python gets to it later, by an
@@ -663,21 +665,21 @@ class BluetoothAudioTest(unittest.TestCase):
             join.stop()
             host.stop()
 
-    def test_sharing_on_slow_airpods_plays_without_jumps(self):
-        """Saifan sharing with his AirPods in: his own playback jumped every 5 s."""
+    def test_sharing_on_airpods_with_sliding_reports_plays_without_jumps(self):
+        """Saifan sharing with his AirPods in: macOS's timing reports for them slide by
+        a few percent; chasing them made his own playback jump several times a second."""
         sd = FakeSoundDevice()
         sd.DEVICES = sd.DEVICES + [{**AirPodsTest.AIRPODS, "name": "Saifan’s AirPods Pro"}]
         with mock.patch.object(sa.shutil, "which", return_value=None):
             host = sa.HostSession(sd, "Saifan", port=free_port(), output_query="Saifan", log=self.quiet).start()
         try:
             self.assertTrue(wait_until(lambda: host.info()["local"]["state"] == "in_sync", 15), host.info())
-            time.sleep(10)                      # the AirPods' speed is measured, the early slip won back
+            time.sleep(4)
             resyncs, delay = host.host.local.resyncs, host.info()["delay_ms"]
             steady = self.watch(lambda: host.info()["local"]["state"], seconds=8)
             raises = 1 if host.info()["delay_ms"] != delay else 0
             self.assertLessEqual(host.host.local.resyncs - resyncs, raises, f"no jumps: {host.info()}")
             self.assertGreaterEqual(steady, 0.95, f"stays In sync: {host.info()}")
-            self.assertAlmostEqual(host.info()["local"]["speed_pct"], 1.3, delta=0.2)
         finally:
             host.stop()
 
