@@ -277,10 +277,14 @@ class Player:
         with self.lock:
             self._dac = None
 
-    def render(self, frames: int, dac_local: float, out_channels: int = 2) -> np.ndarray:
-        """Audio for `frames` frames whose first frame hits the speaker at dac_local."""
+    def render(self, frames: int, dac_local: float, out_channels: int = 2, shift: float = 0.0) -> np.ndarray:
+        """Audio for `frames` frames whose first frame hits the speaker at dac_local.
+        `shift`: how much the output's clock mapping (StreamClock) just moved; the time
+        counted so far was in the old mapping, so it moves with it."""
         s = self.settings
         with self.lock:
+            if shift and self._dac is not None:
+                self._dac += shift
             server_t = self.to_server(self._smooth_dac(dac_local, frames))
             if server_t is None or self.anchor is None:
                 self.read_n = None
@@ -517,6 +521,7 @@ class SoundDeviceOutput:
         self.underflows = 0         # macOS ran out of audio to play: a click
         clock = StreamClock(now)
         good = []                   # the last sensible lead time
+        mapped = []                 # the clock offset used for the last buffer
         failed = []
 
         def callback(outdata, frames, t, status):
@@ -529,7 +534,9 @@ class SoundDeviceOutput:
                     good[:] = [lead]
                 else:                              # timestamps unavailable: don't jump
                     lead = good[0] if good else self.stream.latency
-                outdata[:] = render(frames, t.currentTime + offset + lead, self.channels)
+                shift = offset - mapped[0] if mapped else 0.0
+                mapped[:] = [offset]
+                outdata[:] = render(frames, t.currentTime + offset + lead, self.channels, shift)
             except Exception as e:  # never let an exception kill the stream
                 outdata.fill(0)
                 if not failed:

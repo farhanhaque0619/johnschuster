@@ -203,6 +203,41 @@ class ReportSlideTest(unittest.TestCase):
             self.assertLess(np.abs(e[e[:, 0] > 5, 1]).max(), 0.003, f"{slope}: plays where it should")
 
 
+class FirstReportsTest(unittest.TestCase):
+    def test_late_first_callbacks_dont_misplace_the_audio(self):
+        """At start-up Python runs the first callbacks late, so the first guess of how
+        PortAudio's clock maps onto ours is too late; later guesses are right. The time
+        counted so far moves with the mapping, so the player ends up where the audio is."""
+        streams = []
+
+        class Stream:
+            latency = 0.03
+
+            def __init__(self, **kw):
+                self.callback = kw["callback"]
+                streams.append(self)
+
+            def start(self):
+                pass
+
+        sd = types.SimpleNamespace(OutputStream=Stream, query_devices=lambda *a: {
+            "name": "Speakers", "max_output_channels": 2})
+        player = sa.Player(RATE, 2, lambda t: t)
+        player.feed(0, 10.0, np.zeros((RATE * 4, 2), np.float32))
+        clock = [0.0]
+        sa.SoundDeviceOutput(sd, 0, RATE, player.render, now=lambda: clock[0])
+        epoch, frames = 1000.0, 512
+        for k in range(200):
+            dac = 10.2 + k * frames / RATE                      # when it really plays
+            t = types.SimpleNamespace(currentTime=dac - 0.05 + epoch, outputBufferDacTime=dac + epoch)
+            clock[0] = dac - 0.05 + max(0.0, 0.1 * (1 - k / 40))  # the first ones run up to 100 ms late
+            streams[0].callback(np.zeros((frames, 2), np.float32), frames, t, None)
+            if k == 60:
+                early = player.resyncs          # lining up while the stream starts is fine
+        self.assertAlmostEqual(player._dac, dac, delta=0.001)
+        self.assertEqual(player.resyncs, early, "no jumps once started")
+
+
 class PlayerTest(unittest.TestCase):
     def test_plays_each_sample_at_its_time(self):
         p = sa.Player(RATE, 2, lambda t: t)
