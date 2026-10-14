@@ -261,14 +261,12 @@ class Controller:
 
     def _scan_loop(self):
         """While idle: ask the network who's sharing (broadcast, a chunk of the
-        subnet, remembered addresses) and listen to Bonjour, AirDrop link included."""
+        subnet, remembered addresses) and listen to Bonjour."""
         sweep, sweep_ip = None, None
         while self.running:
             self.nonap.hold(self.session is not None)
-            if self.room_ad:        # the AirDrop link only while looking for each other, never while playing
-                self.room_ad.set_p2p(self.session is None)
             if self.session is not None:
-                for attr in ("browser", "room_browser"):    # the AirDrop link costs Wi-Fi latency
+                for attr in ("browser", "room_browser"):    # browsing costs a little Wi-Fi traffic
                     if getattr(self, attr):
                         getattr(self, attr).stop()
                         setattr(self, attr, None)

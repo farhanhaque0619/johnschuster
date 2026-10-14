@@ -118,8 +118,7 @@ going, so everyone else still hears it.
   seconds. If it keeps happening, move closer to the router or use 5 GHz Wi-Fi.
   Macs also briefly pause Wi-Fi to scan for AirDrop. Running
   `sudo ifconfig awdl0 down` in Terminal on each Mac turns that off until restart,
-  which often fixes repeated dropouts. It also stops Macs finding each other over
-  the AirDrop link, so you may need to type the address.
+  which often fixes repeated dropouts.
 * **Static on Bluetooth headphones (AirPods, Beats).** A Mac's Wi-Fi and Bluetooth
   share one radio, so a busy Wi-Fi connection makes Bluetooth headphones drop audio.
   Since 1.1.4 SyncAudio compresses the stream to about a fifteenth of its old size. If it still happens, check which Wi-Fi band the Mac is on:

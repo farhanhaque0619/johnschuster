@@ -2,10 +2,9 @@
 Finding Macs that are sharing, on networks that make it hard.
 
 Three ways, used together:
-  * Bonjour (macOS's dns-sd tool), also over the Wi-Fi peer-to-peer link that
-    AirDrop uses, so Macs in the same room find each other even when the
-    network blocks broadcasts. The sharing Mac puts its network address in the
-    announcement; the stream itself still goes over the normal Wi-Fi.
+  * Bonjour (macOS's dns-sd tool). The sharing Mac puts its network address in
+    the announcement. (It can also use the AirDrop link, but doesn't by default:
+    that link makes Wi-Fi hop channels and fails when it's turned off.)
   * A sweep of the whole local subnet (the real netmask, not just a /24),
     a chunk per scan, for networks that block broadcasts and Bonjour.
   * Addresses that worked before (remembered by the app).
@@ -20,7 +19,9 @@ import threading
 
 SERVICE = "_syncaudio._tcp"            # a Mac that's sharing
 ROOM_SERVICE = "_syncaudio-room._tcp"  # any open SyncAudio 1.1+ (rooms)
-P2P = ["-includep2p", "-includeAWDL"]    # also over AWDL, the AirDrop link
+P2P = ["-includep2p", "-includeAWDL"]    # also over AWDL, the AirDrop link (off by default:
+                                          # it makes Wi-Fi hop channels, which Bluetooth headphones
+                                          # sharing the radio hear, and finds nothing when AWDL is off)
 SWEEP_CHUNK = 512                         # addresses per scan
 
 
@@ -85,7 +86,7 @@ class Advertiser:
     first few minutes: that link makes Wi-Fi hop channels, which costs a little
     latency, so it stops once people have had time to find this Mac."""
 
-    P2P_SECONDS = 180
+    P2P_SECONDS = 0
 
     def __init__(self, name: str, port: int, ip: str, service: str = SERVICE, p2p_seconds: float = P2P_SECONDS):
         self.name, self.port, self.ip, self.service = name, port, ip, service
@@ -127,7 +128,7 @@ class Advertiser:
 class Browser:
     """Keeps a live list of sharing Macs found with Bonjour: {name: ip}."""
 
-    def __init__(self, p2p: bool = True, service: str = SERVICE):
+    def __init__(self, p2p: bool = False, service: str = SERVICE):
         self.p2p, self.service = p2p, service
         self.found: dict = {}
         self.proc = None
