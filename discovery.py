@@ -70,7 +70,7 @@ def dns_sd() -> str | None:
 
 def parse_browse_line(line: str):
     """'12:00:00.000  Add  3  5 local.  _syncaudio._tcp.  Den' -> ("Add", "Den")."""
-    m = re.match(r"^\S+\s+(Add|Rmv)\s+\S+\s+\d+\s+\S+\s+\S+\s+(.+?)\s*$", line)
+    m = re.match(r"^\s*\S+\s+(Add|Rmv)\s+\S+\s+\d+\s+\S+\s+\S+\s+(.+?)\s*$", line)
     return (m.group(1), m.group(2)) if m else None
 
 

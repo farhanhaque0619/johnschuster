@@ -58,6 +58,10 @@ class BonjourParsingTest(unittest.TestCase):
         self.assertEqual(discovery.parse_browse_line(line), ("Add", "Farhan’s MacBook Pro"))
         self.assertEqual(discovery.parse_browse_line(line.replace("Add", "Rmv")), ("Rmv", "Farhan’s MacBook Pro"))
         self.assertIsNone(discovery.parse_browse_line("Browsing for _syncaudio._tcp.local\n"))
+        # Before 10 o'clock dns-sd pads the hour with a space.
+        self.assertEqual(discovery.parse_browse_line(" 2:47:57.600  Add        3   1 local.               "
+                                                     "_syncaudio._tcp.     SyncAudio test 4e8c2d\n"),
+                         ("Add", "SyncAudio test 4e8c2d"))
 
     def test_resolve_output(self):
         text = ("13:45:01.456  Farhan’s\\032MacBook\\032Pro._syncaudio._tcp.local. can be reached at "
