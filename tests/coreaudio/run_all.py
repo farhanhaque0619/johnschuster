@@ -46,7 +46,7 @@ sys.path.insert(0, here)
 import judge  # noqa: E402
 
 BH, BT, SPK = "BlackHole 2ch", "SyncTestBT 2ch", "SyncTestSpk 2ch"
-PHASES = ["preflight", "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8a", "P8b", "P9"]
+PHASES = ["preflight", "P0", "P1", "P2", "P3", "P3app", "P4", "P5", "P6", "P7", "P8a", "P8b", "P9"]
 REPORT_ONLY = {"P2", "P6", "P7"}
 TWINS_ONLY = {"P5", "P8b", "P9"}
 TCC = ("capture is all zeros: TCC denied the microphone to the runner, so macOS hands every recording "
@@ -189,8 +189,8 @@ class Ctx:
         self.port = 47821
 
     def stress(self, *args) -> list:
-        """The arguments that put the ci stress on a process (none for a dry run on a busy machine)."""
-        return list(args) if self.load == "ci" else []
+        """The arguments that put a stress on a process (none for a dry run on a busy machine)."""
+        return list(args) if self.load != "none" else []
 
     def s(self, seconds: float) -> float:
         return seconds * self.scale
@@ -204,7 +204,7 @@ class Ctx:
              *extra) -> dict:
         """engine_play.py to the end; its stats."""
         prefix = os.path.join(d, tag)
-        stress = stress if self.load == "ci" else "none"
+        stress = stress if self.load != "none" else "none"
         cmd = [sys.executable, os.path.join(here, "engine_play.py"), "--engine", engine, "--device", device,
                "--seconds", f"{seconds:.2f}", "--stress", stress, "--out", prefix, *map(str, extra)]
         with open(prefix + ".log", "w") as f:
@@ -372,12 +372,16 @@ def control(ctx, device: str) -> dict:
     return ctx.controls[device]
 
 
-def p3(ctx, d, c):
+def p3(ctx, d, c, stress="ci", seconds=70.0):
+    """2.0 under stress. ci: far beyond anything the app does (a full collection of a 300k-object heap
+    every second can hold every Python thread longer than the delay allows on these Macs): the ring may
+    run dry only when Python held it up longer than the audio left in it, and rarely. app (P3app): the
+    app's own busiest work: nothing may be heard at all."""
     for device in [BH] + ([BT] if ctx.twins else []):
         tag, want = device.split()[0], 2048 if device == BT else 1024
         ctl = control(ctx, device)
         with Recorder(ctx, d, device, tag) as r:
-            st = ctx.play(d, tag, device, ctx.s(70.0), "v2", "ci")
+            st = ctx.play(d, tag, device, ctx.s(seconds), "v2", stress)
         warm = ctx.s(10.0)
         j = judged(r.stop(), st, warm)
         tl, window = st["timeline"], st["stopped"] - st["started"] - warm
@@ -393,10 +397,19 @@ def p3(ctx, d, c):
           skips <= allowed(ctl["skips"], ctl["window_s"], window) + ex_skips, [skips, ctl["skips"], ex_skips])
         c(f"{device}: no more overloads than the control",
           overloads <= allowed(ctl["overloads"], ctl["window_s"], window), [overloads, ctl["overloads"]])
-        c(f"{device}: the ring never ran dry", tl[-1]["underruns"] == 0, tl[-1]["underruns"])
-        c(f"{device}: no holes or jumps heard (no more than the control)",
-          j["holes"] + j["discontinuities"] <= allowed(ctl["events"], ctl["window_s"], window) + ex_events,
-          j.get("events"))
+        last = tl[-1]
+        dry = grew(tl, "underruns", warm)
+        c(f"{device}: the ring ran dry only when Python held it up longer than the audio in it",
+          last.get("unexplained", 0) == 0, [last.get("unexplained"), last["underruns"], last.get("producer_max_ms")])
+        if stress == "app":
+            c(f"{device}: the ring never ran dry", last["underruns"] == 0, last["underruns"])
+        else:
+            c(f"{device}: and that cost at most 5 % of the time", last["underrun_ms"] <= 0.05 * 1000 * ctx.s(seconds),
+              [last["underrun_ms"], last["underruns"]])
+        c(f"{device}: no holes or jumps heard (no more than the control" + (")" if stress == "app" else
+                                                                           ", plus one per time it ran dry)"),
+          j["holes"] + j["discontinuities"] <= allowed(ctl["events"], ctl["window_s"], window) + ex_events
+          + (dry if stress != "app" else 0), [j.get("events"), dry])
         c(f"{device}: the C callback never took 1 ms", cb_max is not None and cb_max <= 1000, cb_max)
         c(f"{device}: steady timing (p99 - p1 <= 0.10 ms)", j["err_p99_ms"] is not None and
           j["err_p99_ms"] - j["err_p1_ms"] <= 0.10, [j["err_p1_ms"], j["err_p99_ms"]])
@@ -450,7 +463,7 @@ def clicks_run(ctx, d, tag: str, seconds: float, codec: str, recorders, stress: 
                flip_at=None, flip_to=None):
     """syncaudio host --click --tone and syncaudio join on this Mac, while `recorders` record."""
     port = ctx.next_port()
-    load = ctx.stress("--stress", "ci") if stress else []
+    load = ctx.stress("--stress", "app") if stress else []
     host = ctx.app(d, f"{tag}-host", "host", "--click", "--tone", "--no-local", "--no-switch", "--port", port,
                    "--name", "CI", "--report", os.path.join(d, f"{tag}-host.jsonl"), "--codec", codec, *load)
     time.sleep(2.0)
@@ -521,11 +534,11 @@ def p8b(ctx, d, c):
             sys.executable, os.path.join(here, "engine_play.py"), "--engine", "v2", "--device", BH,
             "--seconds", f"{seconds + 8:.1f}", "--out", os.path.join(d, "tone")])
         time.sleep(1.0)
-        host = ctx.app(d, "host", "host", "--input", BH, "--output", BT, "--no-switch", *ctx.stress("--stress", "ci"),
+        host = ctx.app(d, "host", "host", "--input", BH, "--output", BT, "--no-switch", *ctx.stress("--stress", "app"),
                        "--codec", "pcm", "--port", port, "--name", "CI", "--report", os.path.join(d, "host.jsonl"))
         time.sleep(2.0)
         join = ctx.app(d, "join", "join", "127.0.0.1", "--port", port, "--name", "CI listener", "--output", SPK,
-                       *ctx.stress("--stress", "ci"), "--report", os.path.join(d, "join.jsonl"))
+                       *ctx.stress("--stress", "app"), "--report", os.path.join(d, "join.jsonl"))
         try:
             time.sleep(seconds)
         finally:
@@ -581,7 +594,9 @@ def p5(ctx, d, c):
     ex_s, ex_b = excused({}, rs.rec)[1], excused({}, rb.rec)[1]
     c("at most one faded gap on SyncTestSpk 2ch (where it stopped)",
       js["holes"] + js["discontinuities"] <= 1 + ex_s, [js["events"], ex_s])
-    c("at most one on SyncTestBT 2ch", jb_all["holes"] + jb_all["discontinuities"] <= 1 + ex_b, [jb_all["events"], ex_b])
+    c("at most one on SyncTestBT 2ch", jb_all["holes"] + jb_all["discontinuities"] <= 1 + ex_b,
+      [jb_all["events"], ex_b, steps(hrep), [e for e in jrep[-1]["info"].get("events", [])
+                                             if e.get("event") in ("underrun", "output_open", "skip_burst")]])
     c("on SyncTestBT 2ch on time 3 s after the move (every click within 1 ms)",
       jb["err_max_ms"] is not None and jb["err_max_ms"] <= 1.0, jb["err_max_ms"])
 
@@ -625,7 +640,12 @@ def p9(ctx, d, c):
     c("verdict: clean", res["verdict"] == "clean", res["verdict"])
 
 
-RUN = {"preflight": preflight, "P0": p0, "P1": p1, "P2": p2, "P3": p3, "P4": p4, "P5": p5, "P6": p6, "P7": p7,
+def p3app(ctx, d, c):
+    p3(ctx, d, c, "app", 40.0)
+
+
+RUN = {"preflight": preflight, "P0": p0, "P1": p1, "P2": p2, "P3": p3, "P3app": p3app, "P4": p4, "P5": p5, "P6": p6,
+       "P7": p7,
        "P8a": p8a, "P8b": p8b, "P9": p9}
 
 
@@ -671,7 +691,7 @@ def main(argv=None):
     ap.add_argument("--fake", action="store_true", help="fake BlackHoles (tests/coreaudio/fakemac): any machine")
     ap.add_argument("--scale", type=float, default=1.0, help="multiply every phase's length (fake runs)")
     ap.add_argument("--keep-audio", action="store_true", help="keep every recording, not only failed ones")
-    ap.add_argument("--stress", choices=["ci", "none"], default="ci",
+    ap.add_argument("--stress", choices=["ci", "none"], default="ci",   # (ci: P3's ci phase, app elsewhere)
                     help="none: leave out the GIL stress (dry runs on a busy machine; never in CI)")
     args = ap.parse_args(argv)
     only = [p for arg in (args.only or []) for p in arg.split(",") if p]

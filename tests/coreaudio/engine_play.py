@@ -226,7 +226,7 @@ def main(argv=None):
     ap.add_argument("--engine", choices=["v2", "legacy116"], default="v2")
     ap.add_argument("--device", required=True)
     ap.add_argument("--seconds", type=float, required=True)
-    ap.add_argument("--stress", choices=["none", "ci"], default="none")
+    ap.add_argument("--stress", choices=["none", "app", "ci"], default="none")
     ap.add_argument("--legacy-latency", type=float, default=0.1)
     ap.add_argument("--legacy-block", type=int, default=0)
     ap.add_argument("--stall-at", type=float)
@@ -239,7 +239,7 @@ def main(argv=None):
     info = {"engine": args.engine, "device": args.device, "rate": RATE, "D": D, "seconds": args.seconds,
             "stress": args.stress, "clock_delta": abs(sacore.now() - time.monotonic()) if sacore.lib else None,
             "outputs": []}
-    stress = gil_stress.Stress("ci").start() if args.stress == "ci" else None
+    stress = gil_stress.Stress(args.stress).start() if args.stress != "none" else None
     cpu, wall = time.process_time(), time.monotonic()
     try:
         info.update((play_v2 if args.engine == "v2" else play_legacy)(args, index, info))

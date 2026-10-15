@@ -2,7 +2,12 @@
 
 Python never runs on CoreAudio's IO threads: the C callbacks there only copy between the device
 and the rings below. Python talks to the rings from ordinary threads - the output engine writes
-audio 150 ms to 1 s ahead of the DAC, the capture engine drains BlackHole - and every call goes
+audio 150 ms to 1 s ahead of the DAC, the capture engine drains BlackHole.
+
+The ring, content and resampler calls take microseconds and never wait, so they keep the GIL
+(ctypes.PyDLL): letting go of it and getting it back costs a wait for every other busy Python thread,
+and on macOS those waits add up until the output engine can't keep up (CI saw it starve for seconds
+under load). Everything that may block - CoreAudio property calls, the tests' fake IO thread - goes
 through ctypes.CDLL, which lets go of the GIL while the C code runs.
 
 Also here: the ring of received audio and its resampler (Content), and on macOS the optional
@@ -82,15 +87,22 @@ def _bind(lib):
         fn("sa_selectors", None, ptr)
 
 
+FAST = ("sa_now", "sa_version", "sa_ring_state", "sa_ring_log", "sa_out_write", "sa_out_cut", "sa_in_read",
+        "sa_ring_debug_stall", "sa_content_put", "sa_content_range", "sa_resample")   # quick, never wait
+
+
 def _load():
     for path in _candidates():
         if not os.path.exists(path):
             continue
         try:
-            lib = ctypes.CDLL(path)     # CDLL, not PyDLL: every call releases the GIL
+            lib, fast = ctypes.CDLL(path), ctypes.PyDLL(path)
             _bind(lib)
+            _bind(fast)
         except (OSError, AttributeError):
             continue
+        for name in FAST:               # the same symbols, called without letting go of the GIL
+            setattr(lib, name, getattr(fast, name))
         return lib, path
     return None, None
 

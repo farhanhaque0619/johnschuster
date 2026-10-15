@@ -435,6 +435,12 @@ class OutputEngine:
         self.silent = True
         self.splices = self.reseeks = self.steps = 0
         self.gaps = self.gap_frames = 0     # re-seeks the C side can't see as underruns (see _fill)
+        # Every time the ring ran dry, was it because this thread (or the audio's arrival) was held up by
+        # Python for longer than the audio it had left in the ring? That is the one thing 2.0 can't ride
+        # out. If it came back in time and the ring ran dry anyway, that's a bug: `unexplained`.
+        self.unexplained = 0
+        self._lead_left = None              # seconds of audio left in the ring after the last fill
+        self._loop = None                   # seconds since the tick before this one started
         self._gap = None                # (C's underrun count, frames) of a gap until the next tick checks it
         self.err = 0.0                  # the last timing error measured (s, + = content late)
         self.sync_since = None          # since when the timing has held in sync (see _track_sync)
@@ -506,6 +512,7 @@ class OutputEngine:
             self._callbacks(recs)
         st = self.ring.state()
         self._count(st, now)
+        self._loop = loop
         if self.clock.ready:
             # The arrival edge, read once a tick: each call into C lets go of the GIL, and under load
             # getting it back can take tens of ms. (What arrives meanwhile waits for the next tick.)
@@ -563,6 +570,9 @@ class OutputEngine:
         if w < r + guard:                       # first time, or the ring ran dry (Python stalled for
             if self.cursor is not None and not self.silent:        # longer than ahead, or the audio
                 self.reseeks += 1                                   # came too late)
+                if self._loop is not None and self._lead_left is not None and \
+                        self._loop < self._lead_left - guard / self.rate - 0.010:  # back in time: a bug
+                    self.unexplained += 1
                 # Some audio was left, but less than the device may take next: the new run starts past
                 # it, and the silence between is audio missing like any underrun - which the C side
                 # counts only when the ring runs out (edge < r), not for a gap between runs.
@@ -590,6 +600,7 @@ class OutputEngine:
                 break
         if w < edge:            # rewound, and the new line has only arrived this far: the rest of the
             self.ring.cut(w, guard)     # ring is the old line (the new one is written as it arrives)
+        self._lead_left = (w - r) / self.rate
 
     def _change(self, x: float):
         """The next delay change after content x: (n_s, due on the new line, due on the old line)."""
@@ -865,7 +876,7 @@ class OutputEngine:
                "cb_per_s": round((cs["callbacks"] - rep["callbacks"]) / dt, 1) if self._report_t != now else None,
                "cb_max_us": round(rep["cb_max_ns"] / 1000, 1),
                "skips": cs["skips"], "skipped_ms": round(cs["skipped_frames"] / self.rate * 1000, 1),
-               "pa_flags": rep["flags"], "underruns": cs["underrun_events"],
+               "pa_flags": rep["flags"], "underruns": cs["underrun_events"], "unexplained": self.unexplained,
                "underrun_ms": round(cs["underrun_frames"] / self.rate * 1000, 1),
                "ring_lead_min_ms": None if rep["lead_min"] == sacore.NO_LEAD else ms(rep["lead_min"] / self.rate),
                "ahead_ms": ms(self.ahead), "headroom_min_ms": ms(self.headroom_min),

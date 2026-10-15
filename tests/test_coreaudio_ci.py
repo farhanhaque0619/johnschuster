@@ -279,8 +279,8 @@ class ScriptsOnFakeDevicesTest(unittest.TestCase):
         phases = res["phases"]
         print(f"\n  run_all on fake devices, {time.monotonic() - started:.0f} s: " +
               ", ".join(f"{n} {p['status']}" for n, p in phases.items()), file=sys.stderr)
-        self.assertEqual(list(phases), ["preflight", "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8a", "P8b",
-                                        "P9"], run.stdout[-3000:])
+        self.assertEqual(list(phases), ["preflight", "P0", "P1", "P2", "P3", "P3app", "P4", "P5", "P6", "P7", "P8a",
+                                        "P8b", "P9"], run.stdout[-3000:])
         for name, p in phases.items():
             for a in p.get("attempts", []):
                 broke = [c for c in a["checks"] if c["check"].startswith("ran (")]
