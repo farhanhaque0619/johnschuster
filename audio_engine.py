@@ -439,8 +439,9 @@ class OutputEngine:
         # Python for longer than the audio it had left in the ring? That is the one thing 2.0 can't ride
         # out. If it came back in time and the ring ran dry anyway, that's a bug: `unexplained`.
         self.unexplained = 0
-        self._lead_left = None              # seconds of audio left in the ring after the last fill...
-        self._fill_t = None                 # ...and when that fill ended
+        self._lead_left = None              # seconds of audio in the ring after the last fill, counted
+        self._fill_t = None                 # from where the device was when this was read (its time)
+        self._state_t = None
         self._gap = None                # (C's underrun count, frames) of a gap until the next tick checks it
         self.err = 0.0                  # the last timing error measured (s, + = content late)
         self.sync_since = None          # since when the timing has held in sync (see _track_sync)
@@ -511,6 +512,7 @@ class OutputEngine:
         if len(recs):
             self._callbacks(recs)
         st = self.ring.state()
+        self._state_t = self.now()              # when r (where the device is) was read
         self._count(st, now)
         if self.clock.ready:
             # The arrival edge, read once a tick: each call into C lets go of the GIL, and under load
@@ -599,7 +601,7 @@ class OutputEngine:
                 break
         if w < edge:            # rewound, and the new line has only arrived this far: the rest of the
             self.ring.cut(w, guard)     # ring is the old line (the new one is written as it arrives)
-        self._lead_left, self._fill_t = (w - r) / self.rate, self.now()
+        self._lead_left, self._fill_t = (w - r) / self.rate, self._state_t
 
     def _change(self, x: float):
         """The next delay change after content x: (n_s, due on the new line, due on the old line)."""
