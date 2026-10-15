@@ -1,3 +1,12 @@
 .venv/
 __pycache__/
 build_info.json
+# built by native/build.sh
+libsacore.*
+libsacore_test.dylib
+libsacore_asan.so
+# tests/coreaudio/run_all.py's evidence
+/ca-*/
+/coreaudio-results.json
+/preflight.json
+/devices.json

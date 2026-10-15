@@ -5,14 +5,12 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 import app  # noqa: E402
 import room  # noqa: E402
-import syncaudio as sa  # noqa: E402
-from test_syncaudio import FakeSoundDevice, free_port, wait_until  # noqa: E402
+from test_syncaudio import FakeSoundDevice, free_port, hermetic, wait_until  # noqa: E402
 
 
 def agent(name, changes=None):
@@ -103,8 +101,8 @@ class TwoMacsTest(unittest.TestCase):
     """Two whole apps (simulated audio) connect once, then pass the music back and forth."""
 
     def setUp(self):
-        self.which = mock.patch.object(sa.shutil, "which", return_value=None)
-        self.which.start()
+        self.hermetic = hermetic()          # this computer's real sound output is never touched
+        self.hermetic.__enter__()
         tmp = Path(tempfile.mkdtemp())
         self.macs = []
         for name in ("Farhan", "Saifan"):
@@ -116,7 +114,7 @@ class TwoMacsTest(unittest.TestCase):
     def tearDown(self):
         for c in self.macs:
             c.shutdown()
-        self.which.stop()
+        self.hermetic.close()
 
     def test_switch_whose_music_without_stopping(self):
         farhan, saifan = self.macs

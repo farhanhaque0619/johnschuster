@@ -37,6 +37,31 @@ updater, and it skips the "can't verify" prompt):
 curl -fsSL https://github.com/farhanhaque0619/johnschuster/releases/latest/download/install.sh | bash
 ```
 
+## What's new in 2.0
+
+SyncAudio 2.0 rebuilds the part that plays the sound, to get rid of the static
+some people heard on AirPods.
+
+* **The part that feeds your speakers or headphones is now a tiny piece of
+  native code** that never waits for the rest of the app. It always asks macOS
+  for a big playback buffer, and it times every sample by macOS's own clock. If
+  macOS ever drops a bit of audio, 2.0 counts it and stays exactly in time
+  instead of slowly falling behind.
+* **Both Macs must be on 2.0.** 1.x and 2.0 can't play together. They still see
+  each other, and the app tells you which Mac needs updating.
+* **The delay is longer with AirPods (about 0.6 s).** Play and pause in Spotify
+  feel a little slower to respond. That's on purpose: it's what keeps Wi-Fi
+  hiccups from ever being heard. It may shrink a bit after a few quiet minutes,
+  and when it has to change, SyncAudio waits for a quiet moment, like the gap
+  between songs.
+* **New: Settings → Test my headphones.** It plays a quiet tone for 30 seconds:
+  the first 10 the old way (which may crackle), the next 20 with 2.0. Then it
+  tells you whether macOS played every bit of it. Run it once on each Mac with
+  your headphones in.
+* Each Mac remembers its **Sync nudge** separately for every speaker and pair of
+  headphones. Nudges from 1.x start again at 0: they made up for 1.x's own timing,
+  which 2.0 doesn't have.
+
 ## Use it
 
 ### Connect your Macs once, then switch whose music plays
@@ -88,10 +113,10 @@ going, so everyone else still hears it.
 
 * SyncAudio never uses the AirPods' microphone, so they stay in full-quality
   music mode. (Joining a call on them switches them to call mode, which sounds
-  worse. That's macOS, not SyncAudio.)
+  worse. That's macOS, not SyncAudio; the app tells you when it happens.)
 * AirPods hold on to quite a lot of audio before playing it. SyncAudio measures
-  how much on every Mac and raises the delay to cover it automatically, so leave
-  **Delay** on **Auto**.
+  how much on every Mac, remembers it, and starts with enough delay to cover it
+  (about 0.6 s), so leave **Delay** on **Auto**.
 * macOS's figure for how late Bluetooth plays isn't perfect. If someone on
   AirPods hears things slightly early or late compared to speakers in the room,
   use **Sync nudge** on their Mac.
@@ -107,6 +132,9 @@ going, so everyone else still hears it.
 * **"Can't reach …" when joining.** The app says why underneath: wrong address,
   the network keeping devices apart, the Mac not sharing, or macOS blocking
   local-network access.
+* **"… needs updating" or "Different versions".** SyncAudio 2.0 can't play
+  together with 1.x. Update the other Mac (**Settings → Check for updates**, or
+  the Terminal line under [Updating](#updating)).
 * **The bar doesn't move while music plays** (listeners hear silence; their app says
   so). The sharing Mac's sound output must be **BlackHole 2ch**, not "Multi-Output
   Device" or anything else. SyncAudio sets this itself and puts it back if it changes.
@@ -119,24 +147,26 @@ going, so everyone else still hears it.
   Macs also briefly pause Wi-Fi to scan for AirDrop. Running
   `sudo ifconfig awdl0 down` in Terminal on each Mac turns that off until restart,
   which often fixes repeated dropouts.
-* **Static on Bluetooth headphones (AirPods, Beats).** A Mac's Wi-Fi and Bluetooth
-  share one radio, so a busy Wi-Fi connection makes Bluetooth headphones drop audio.
-  Since 1.1.4 SyncAudio compresses the stream to about a fifteenth of its old size. If it still happens, check which Wi-Fi band the Mac is on:
-  hold **Option** and click the Wi-Fi icon in the menu bar. **2.4 GHz** (channels
-  1-14) is the bad one; join the 5 GHz version of the network if there is one
-  (often the same name with "5G"), or sit closer to the router. Copy diagnostics
-  shows the channel too.
-* **Static, or "Getting in sync" over and over, especially on AirPods.** Update to 1.1.5
-  or newer. macOS reports Bluetooth headphones' timing with errors that slide by
-  several percent; older versions followed those reports and kept jumping to catch
-  up. SyncAudio now times playback by the audio the headphones actually take.
-* **Plays fine for a minute or two, then breaks up and drops.** Update to 1.1.1 or
-  newer. Older versions let a listener fall further and further behind when the Wi-Fi
-  couldn't keep up, and macOS slowed the app down once its window was hidden.
+* **Static on AirPods or other Bluetooth headphones.** First make sure both Macs
+  have 2.0. Then stop sharing or listening and run **Settings → Test my headphones**
+  (30 seconds, a quiet tone). If it says **macOS is dropping audio on these
+  headphones**, the static is between macOS and the headphones, not in SyncAudio.
+  Try: quit apps that use the mic (Zoom, FaceTime), turn Bluetooth off and on,
+  unpair other Bluetooth devices nearby, and check whether the same song from the
+  Music app also crackles. Then send us diagnostics.
+* **Still static, and the test says it's clean.** A Mac's Wi-Fi and Bluetooth share
+  one radio, so a busy Wi-Fi connection makes Bluetooth headphones drop audio.
+  Check which Wi-Fi band the Mac is on: hold **Option** and click the Wi-Fi icon in
+  the menu bar. **2.4 GHz** (channels 1-14) is the bad one; join the 5 GHz version
+  of the network if there is one (often the same name with "5G"), or sit closer to
+  the router. Copy diagnostics shows the channel too.
+* **Play and pause feel slow with AirPods.** That's the longer delay 2.0 keeps with
+  Bluetooth headphones (about 0.6 s), so a Wi-Fi hiccup is never heard. It can
+  shrink a little after a few calm minutes.
 * **Still stuck?** Open **Settings → Copy diagnostics** and paste the result to
   whoever is helping you. That's a short summary; the full report (versions, network
-  details, audio devices and the last few minutes of sync measurements) is saved as
-  **SyncAudio diagnostics.txt** on your Desktop.
+  details, audio devices, the headphone test and the last few minutes of sync
+  measurements) is saved as **SyncAudio diagnostics.txt** on your Desktop.
 * **No sound on the sharing Mac after a crash.** Open SyncAudio again and it puts the
   sound back, or pick your speakers in **Control Center → Sound**.
 
@@ -147,9 +177,13 @@ block with the exact moment it should come out of the speakers, compressed with
 Opus (about 100 kbit/s instead of 1.5 Mbit/s). Every Mac,
 including the sharing one, holds each block until that moment. The Macs
 match clocks by pinging each other constantly and trusting only the fastest
-round trips. Each Mac also corrects for its own speaker's delay as reported
-by macOS. Clock drift is fixed by adding or skipping a single sample now and
-then, which you can't hear.
+round trips.
+
+On each Mac, a small piece of C code hands the sound to macOS. It runs on
+macOS's own audio thread and never waits for the rest of the app, which keeps it
+filled up to a second ahead. Every sample is timed by macOS's clock for that
+speaker, including its own delay, and the music is played a few hundredths of a
+percent faster or slower to stay exactly on time, which you can't hear.
 
 In simulated tests with drifting clocks and jittery Wi-Fi, the Macs stay
 within about 1 ms of each other. For scale, sound takes about 3 ms to cross
@@ -160,13 +194,17 @@ a metre of room.
 ## For developers
 
 The app is `app.py` (a small local web server plus a native window) around
-the engine in `syncaudio.py`, with the interface in `ui/index.html`.
+the engine in `syncaudio.py`, with the interface in `ui/index.html`. The audio
+itself goes through `audio_engine.py` and libsacore (`native/sacore.c`), the C
+code that runs on CoreAudio's IO threads; `sacore.py` loads it.
 
-**Run from source** (Python 3.9+):
+**Run from source** (Python 3.12, and Apple's command line tools for the C part:
+`xcode-select --install`):
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt pywebview
+bash native/build.sh                 # builds libsacore.dylib; nothing plays without it
 .venv/bin/python app.py              # or: app.py --browser
 ```
 
@@ -179,15 +217,23 @@ The app is ad-hoc signed, not notarized, which is why macOS asks you to confirm
 the first launch. With an Apple Developer account it could be signed and
 notarized so that prompt goes away.
 
-**Tests** (no audio hardware needed):
+**Tests** (no audio hardware needed; Linux works too):
 
 ```bash
-python3 -m unittest discover tests
+python3 tests/run_ci.py         # builds libsacore (native/build.sh) first
 ```
 
 They simulate Macs whose clocks and sound cards drift apart over jittery Wi-Fi,
-run real sessions with three Macs over the network with simulated speakers,
-and drive the app's API.
+play SyncAudio's real C audio callbacks against simulated devices (in virtual
+time, and in real time on a fake audio thread), run real sessions with three
+Macs over the network, and drive the app's API.
+
+Before a release, the workflow also plays through real CoreAudio on a CI Mac
+(`tests/coreaudio/run_all.py`): BlackHole loops the sound back, a separate
+process records it, and every recorded sample is checked against when it should
+have played, under deliberate load. The old 1.1.6 engine must fail that test
+(or it couldn't see the bug); 2.0 must pass it. To try those scripts anywhere,
+on fake loopback devices: `python3 tests/coreaudio/run_all.py --fake --twins yes --scale 0.25`.
 
 ### Terminal version
 
@@ -195,9 +241,10 @@ The same engine works from the Terminal, without the app:
 
 ```bash
 ./setup.sh host                 # on the sharing Mac (installs BlackHole via Homebrew)
-./setup.sh                      # on the others
+./setup.sh                      # on the others (both build the audio core: needs xcode-select --install)
 ./syncaudio host                # share (add --click for the metronome)
 ./syncaudio join [address]      # listen; finds the host by itself
+./syncaudio selftest            # "Test my headphones" on the current output
 ```
 
 Keys while running: `+`/`-` volume, `[` `]` nudge 1 ms (`{` `}` 10 ms),

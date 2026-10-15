@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 import uuid
 from pathlib import Path
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 import app  # noqa: E402
 import discovery  # noqa: E402
+import sacore  # noqa: E402
 import syncaudio as sa  # noqa: E402
 from test_syncaudio import FakeSoundDevice, free_port, wait_until  # noqa: E402
 
@@ -185,11 +187,24 @@ class QuitTest(unittest.TestCase):
 
 class DiagnosticsTest(unittest.TestCase):
     def test_report_has_what_we_need(self):
-        c = app.Controller(sd=FakeSoundDevice(), prefs_file=Path(tempfile.mkdtemp()) / "p.json", scan=False)
-        report = json.loads(c.diagnostics())
-        for key in ("app", "macos", "network", "devices", "session", "history", "events"):
+        # macOS's own figures for each device, as the helper in libsacore reads them (in frames)
+        mac = types.SimpleNamespace(device_info=lambda name, out: {
+            "uid": f"{name} {'out' if out else 'in'}", "transport": "virt", "latency": 0, "safety": 0,
+            "stream_latency": 0, "buffer_frames": 512, "buffer_min": 14, "buffer_max": 4096, "nominal_rate": 48000.0})
+        with mock.patch.object(sacore, "mac", mac):
+            c = app.Controller(sd=FakeSoundDevice(), prefs_file=Path(tempfile.mkdtemp()) / "p.json", scan=False)
+            report = json.loads(c.diagnostics())
+        for key in ("app", "macos", "system", "network", "devices", "audio", "session", "delay_events", "clock_pings",
+                    "python", "selftest", "history", "events", "coreaudiod_overloads"):
             self.assertIn(key, report)
-        self.assertEqual(report["devices"][0]["name"], "BlackHole 2ch")
+        blackhole, mic, speakers = report["devices"]
+        self.assertEqual((blackhole["name"], blackhole["uid"], sorted(blackhole["coreaudio"])),
+                         ("BlackHole 2ch", "BlackHole 2ch out", ["in", "out"]))
+        self.assertEqual((mic["uid"], sorted(mic["coreaudio"]), speakers["coreaudio"]["out"]["buffer_min"]),
+                         ("MacBook Pro Microphone in", ["in"], 14))
+        self.assertEqual(speakers["out_latency_ms"], [30.0, 100.0])
+        self.assertEqual((report["audio"], report["selftest"], report["python"]["gc_top_ms"]),
+                         (None, {"running": False}, None))
 
     def test_copy_gives_a_whole_summary_and_saves_the_full_report(self):
         # Copy diagnostics used to cut everything off after 500 characters.

@@ -121,6 +121,7 @@
   details.settings summary::after { content: "›"; float: right; color: var(--muted); transition: transform .2s; }
   details.settings[open] summary::after { transform: rotate(90deg); }
   details.settings .ctl > span { width: 150px; }
+  details.settings .ctl > span.small { width: auto; flex: 1; min-width: 0; }
   footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 6px; }
 </style>
 </head>
@@ -239,6 +240,8 @@
         <div style="margin-top:8px"><button class="primary" data-action="fix-firewall">Allow SyncAudio</button>
         <span class="muted small">Asks for your Mac password.</span></div>
       </div>
+      <div class="help" id="host-old" hidden></div>
+      <div class="help" id="host-audio" hidden></div>
       <button id="btn-click">Play test clicks</button>
     </div>
 
@@ -254,10 +257,11 @@
         <div class="seg" id="delay-mode"><button data-mode="auto">Auto</button><button data-mode="manual">Manual</button></div>
       </div>
       <div class="ctl" id="delay-manual" hidden>
-        <input type="range" id="delay" min="60" max="1000" step="10" aria-label="Delay">
+        <input type="range" id="delay" min="60" max="2000" step="10" aria-label="Delay">
         <b id="delay-value" style="min-width:64px;text-align:right"></b>
       </div>
       <p class="muted small" id="delay-text"></p>
+      <p class="small" id="delay-notice" style="margin:0" hidden></p>
     </div>
   </section>
 
@@ -278,6 +282,7 @@
         <div><b id="st-drop">0</b><label>Glitches</label></div>
       </div>
       <div class="help" id="listen-version" style="margin-bottom:0" hidden></div>
+      <div class="help" id="listen-audio" style="margin-bottom:0" hidden></div>
     </div>
   </section>
 
@@ -310,6 +315,9 @@
     <div class="ctl"><span>Play on this Mac while sharing</span><input type="checkbox" id="play-local"></div>
     <div class="ctl"><span>Version</span><span id="version-text" style="flex:1"></span>
       <button class="link" data-action="check-update">Check for updates</button></div>
+    <div class="ctl"><span>Static on your headphones?</span>
+      <button id="btn-selftest">Test my headphones</button></div>
+    <div class="help" id="selftest" hidden></div>
     <div class="ctl"><span>Something wrong?</span>
       <button id="btn-diag">Copy diagnostics</button>
       <span class="muted small" id="diag-hint"></span></div>
@@ -365,6 +373,7 @@ function render(s) {
   if (mode === "hosting") renderHosting(s);
   if (mode === "listening") renderListening(s);
   renderControls(s);
+  renderSelftest(s);
   $("footer").textContent = `${s.app.name} ${s.app.version}`;
 }
 
@@ -481,6 +490,19 @@ function renderIdle(s) {
   if (fresh("manual-address") && !$("manual-address").value && s.last_host) $("manual-address").value = s.last_host;
 }
 
+// What macOS is doing to this Mac's output: a call took the headphones over, or it is dropping audio.
+function audioWarning(audio, p) {
+  const out = (audio && audio.output) || {};
+  const notes = [];
+  if (out.call_profile) notes.push(`<b>Another app is using your headphones' microphone</b>, so macOS switched them
+    to call quality. Quit Zoom/FaceTime or pick "MacBook Microphone" as input.`);
+  const dropping = (what) => `<b>macOS is dropping audio on this output</b> (${what}). This isn't SyncAudio's timing;
+    see <b>Test my headphones</b> in Settings.`;
+  if (out.warning === "output_dropping") notes.push(dropping(`${out.skips_60s} time${out.skips_60s === 1 ? "" : "s"} in the last minute`));
+  else if (p && p.lossy) notes.push(dropping(`about ${p.loss_pct}% of it`));
+  return notes.join("<br><br>");
+}
+
 function speakerRow(name, st, detail) {
   return `<li><span class="dot ${st}"></span><div class="grow"><div class="name">${esc(name)}</div>
           <div class="muted small">${esc(detail)}</div></div></li>`;
@@ -497,21 +519,33 @@ function renderHosting(s) {
   show($("host-silent"), !h.click && (h.silent_s > 20 || (h.silent_s > 6 && h.listeners.length > 0)));
   $("btn-click").textContent = h.click ? "Back to this Mac's audio" : "Play test clicks";
   show($("firewall-warn"), !!(s.firewall && s.firewall.needs_fix));
+  const old = h.listeners.filter((l) => l.old);
+  show($("host-old"), old.length > 0);
+  setHTML($("host-old"), old.map((l) => `<b>${esc(l.name)} has SyncAudio ${esc(l.version || "1.x")}.</b> `).join("")
+    + "SyncAudio 2.0 can't play together with 1.x. Update the other Mac (Settings → Check for updates).");
+  const warn = audioWarning(h.audio, h.local);
+  show($("host-audio"), !!warn);
+  setHTML($("host-audio"), warn);
 
   let rows = "";
   if (h.local) rows += speakerRow("This Mac", h.local.state, (STATE_TEXT[h.local.state] || "") + (h.output ? " · " + h.output : "")
     + (h.local.glitches ? ` · ${h.local.glitches} glitch${h.local.glitches === 1 ? "" : "es"}` : ""));
   for (const l of h.listeners) {
+    if (l.old) {
+      rows += speakerRow(l.name, "bad", `Has SyncAudio ${l.version || "1.x"}: needs updating to 2.0 to play`);
+      continue;
+    }
     let detail = STATE_TEXT[l.state] || "Connecting…";
     if (l.wifi_ms != null) detail += ` · Wi-Fi ${ms(l.wifi_ms)}`;
     const g = l.glitches ?? l.dropouts;
     if (g) detail += ` · ${g} glitch${g === 1 ? "" : "es"}`;
-    if (l.version !== s.app.version) detail += l.version ? ` · has SyncAudio ${l.version}` : " · older SyncAudio, needs updating";
+    if (l.version !== s.app.version) detail += ` · has SyncAudio ${l.version}`;
     rows += speakerRow(l.name, l.state, detail);
   }
   setHTML($("speakers"), rows);
-  setHTML($("join-hint"), h.listeners.length
-    ? `${h.listeners.length} Mac${h.listeners.length === 1 ? "" : "s"} listening. More can join any time.`
+  const playing = h.listeners.length - old.length;
+  setHTML($("join-hint"), playing
+    ? `${playing} Mac${playing === 1 ? "" : "s"} listening. More can join any time.`
     : `No one has joined yet. On another Mac, open SyncAudio: this Mac shows up under <b>Join</b>.
        If it doesn't, they can type this address: <b>${esc(s.address)}</b>
        <button class="link" data-copy="${esc(s.address)}">Copy</button>`);
@@ -521,8 +555,11 @@ function renderHosting(s) {
   if (fresh("delay")) $("delay").value = h.delay_ms;
   $("delay-value").textContent = ms(fresh("delay") ? h.delay_ms : $("delay").value);
   $("delay-text").textContent = h.auto_delay
-    ? `Now ${h.delay_ms} ms. SyncAudio keeps it as low as your Wi-Fi allows and raises it if anyone's audio arrives late.`
+    ? `Now ${h.delay_ms} ms. SyncAudio keeps it long enough for everyone's Wi-Fi and headphones, and raises it if anyone's audio arrives late.`
     : "Lower means less lag behind video. Higher means fewer dropouts on weak Wi-Fi.";
+  const adjusting = h.glide || h.delay_target_ms !== h.delay_ms;
+  show($("delay-notice"), adjusting);
+  $("delay-notice").textContent = `Adjusting the delay to ${h.delay_target_ms} ms at the next quiet moment…`;
 }
 
 function renderListening(s) {
@@ -530,11 +567,14 @@ function renderListening(s) {
   const host = c.host_name || c.address;
   $("listen-title").textContent = "Listening to " + host;
   let dot = "waiting", title, detail = "";
+  const oldHost = !!(c.problem && c.problem.code === "old_host");
   if (c.connection === "connected") {
     dot = c.state;
     title = c.clock ? (STATE_TEXT[c.state] || "Connecting…") : "Syncing clocks…";
     if (c.state === "in_sync") detail = "Playing on " + c.output;
     if (c.state === "no_audio") detail = "Wi-Fi hiccup. The sharing Mac raises the delay automatically.";
+  } else if (oldHost) {
+    dot = "bad"; title = host + " needs updating";
   } else if (c.connection === "retrying") {
     dot = "bad"; title = "Can't reach " + host;
     detail = (c.problem ? c.problem.message : "Make sure it's still sharing and both Macs are on the same Wi-Fi.")
@@ -552,13 +592,46 @@ function renderListening(s) {
   $("listen-status").textContent = title;
   $("listen-detail").textContent = detail;
   const hv = c.host_version, mine = s.app.version;
-  show($("listen-version"), c.connection === "connected" && hv !== mine);
-  $("listen-version").innerHTML = hv
-    ? `<b>Different versions.</b> ${esc(host)} has SyncAudio ${esc(hv)}, this Mac has ${esc(mine)}. Update the older one so both match (Settings → Check for updates).`
-    : `<b>${esc(host)} has an older SyncAudio.</b> It can't keep AirPods and other headphones fed, so you may hear nothing. Update SyncAudio on that Mac.`;
+  show($("listen-version"), oldHost || (c.connection === "connected" && !!hv && hv !== mine));
+  setHTML($("listen-version"), oldHost
+    ? `<b>${esc(host)} has ${hv ? "SyncAudio " + esc(hv) : "an older SyncAudio"}.</b> SyncAudio 2.0 can't play together with 1.x. Update the other Mac (Settings → Check for updates).`
+    : `<b>Different versions.</b> ${esc(host)} has SyncAudio ${esc(hv)}, this Mac has ${esc(mine)}. Update the older one so both match (Settings → Check for updates).`);
+  const warn = c.connection === "connected" ? audioWarning(c.audio, c) : "";
+  show($("listen-audio"), !!warn);
+  setHTML($("listen-audio"), warn);
   $("st-wifi").textContent = ms(c.wifi_ms);
   $("st-delay").textContent = ms(c.delay_ms);
   $("st-drop").textContent = c.glitches ?? c.dropouts ?? 0;
+}
+
+// "Test my headphones": 10 s the old way, 20 s SyncAudio 2.0, then what that says about the static.
+function renderSelftest(s) {
+  const t = s.selftest || {};
+  const busy = s.mode !== "idle";
+  $("btn-selftest").disabled = !!t.running || busy;
+  let html = "";
+  if (t.running) {
+    const [first, then] = t.seconds || [10, 20];
+    const left = Math.max(0, Math.ceil(first + then - (Date.now() / 1000 - t.started)));
+    const part = (phase, text) => `<span class="${t.phase === phase ? "" : "muted"}">${text}</span>`;
+    html = `<div class="row"><span class="spinner"></span><span>Playing a quiet tone on <b>${esc(t.output)}</b>… ${left} s left</span></div>
+      <div class="small" style="margin-top:6px">${part("legacy", `first ${first} s: the old way (may crackle)`)} ·
+      ${part("v2", `next ${then} s: SyncAudio 2.0`)}</div>`;
+  } else if (t.message) {
+    html = esc(t.message);
+    const r = t.result;
+    if (r) {
+      const o = r.legacy, v = r.v2;
+      html += `<div class="muted small" style="margin-top:6px">Tested on ${esc(r.output)}. `
+        + (o ? `The old way: ${o.frames_min}–${o.frames_max}-frame buffers, ${o.lost_ms_per_s ?? "?"} ms lost per second. ` : "")
+        + `SyncAudio 2.0: ${v.io_frames}-frame buffers, ${v.skips} skipped, ${v.overloads} overloads, ${v.underruns} run dry. `
+        + `Copy diagnostics includes this.</div>`;
+    }
+  }
+  if (busy && !t.running) html += `<div class="muted small"${html ? ' style="margin-top:6px"' : ""}>To run the test,
+    stop sharing or listening first: it needs your headphones to itself for 30 seconds.</div>`;
+  show($("selftest"), !!html);
+  setHTML($("selftest"), html);
 }
 
 function renderControls(s) {
@@ -625,6 +698,7 @@ $("btn-test").addEventListener("click", () => {
   const address = $("manual-address").value.trim();
   if (address) post("test-connection", {address});
 });
+$("btn-selftest").addEventListener("click", () => post("selftest"));
 $("btn-diag").addEventListener("click", () => {
   post("copy-diagnostics");
   $("diag-hint").textContent = "Copied a short summary to paste. The full report is on your Desktop.";

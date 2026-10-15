@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build:
     runs-on: macos-14       # Apple Silicon (M1 and newer)
-    timeout-minutes: 30
+    timeout-minutes: 45     # (the tests alone take 10-15 minutes since 2.0)
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +30,17 @@ jobs:
           # Opus compresses the stream to a tenth (Wi-Fi shares its radio with Bluetooth headphones).
           brew install opus
           echo "OPUS_LIB=$(realpath "$(brew --prefix opus)/lib/libopus.0.dylib")" >> "$GITHUB_ENV"
+
+      - name: Build libsacore (the C code on CoreAudio's IO threads) and check it never touches Python
+        run: |
+          bash native/build.sh
+          echo "SACORE_LIB=$PWD/libsacore.dylib" >> "$GITHUB_ENV"
+          if nm -u libsacore.dylib | grep -q '_Py'; then echo "libsacore imports Python symbols"; exit 1; fi
+          if nm -gU libsacore.dylib | grep -q '_sa_fake'; then echo "the shipped libsacore has test code"; exit 1; fi
+          if otool -L libsacore.dylib | tail -n +2 | grep -v libsacore \
+               | grep -vqE '^[[:space:]]+(/System/Library/Frameworks/|/usr/lib/libSystem)'; then
+            otool -L libsacore.dylib; echo "unexpected linkage"; exit 1; fi
+          python -c 'import sacore,time; assert sacore.lib; d=abs(sacore.now()-time.monotonic()); print("clock delta",d); assert d<1e-3'
 
       - name: Run the tests on a real Mac
         run: python tests/run_ci.py
@@ -53,6 +64,8 @@ jobs:
           printf '{"version": "%s", "commit": "%s", "build": %s}\n' "$APP_VERSION" "$GITHUB_SHA" "$GITHUB_RUN_NUMBER" > build_info.json
           cat build_info.json
           pyinstaller --noconfirm --clean packaging/SyncAudio.spec
+          # From here on the app must find the libsacore inside it (its self-test checks it's that copy).
+          echo "SACORE_LIB=" >> "$GITHUB_ENV"
 
       - name: Check the built app
         run: |
@@ -149,14 +162,111 @@ jobs:
             packaging/install.sh
             build_info.json
 
+  linux-tests:
+    # The same tests on Linux, where libsacore also runs under AddressSanitizer/UndefinedBehaviorSanitizer
+    # and ThreadSanitizer (tests/test_engine_realtime.py SanitizerTest, test_sacore_ring.py TSanTest).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30     # (about 15 minutes on a 4-core machine)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y libopus0
+          python -m pip install --upgrade pip numpy
+      - name: Run the tests (and the sanitizer builds) on Linux
+        run: python tests/run_ci.py
+
+  realtime-audio:
+    # 2.0's engine on real CoreAudio, judged at the "speaker": BlackHole loops what is played back
+    # as input, and a separate, unstressed recorder process captures it (tests/coreaudio/run_all.py).
+    # The frozen 1.1.6 engine must FAIL here (the canary), or these tests can't see the bug.
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          brew install opus
+          echo "OPUS_LIB=$(realpath "$(brew --prefix opus)/lib/libopus.0.dylib")" >> "$GITHUB_ENV"
+
+      - name: Build libsacore (the shipped build) and check it never touches Python
+        run: |
+          bash native/build.sh
+          echo "SACORE_LIB=$PWD/libsacore.dylib" >> "$GITHUB_ENV"
+          if nm -u libsacore.dylib | grep -q '_Py'; then echo "libsacore imports Python symbols"; exit 1; fi
+          if otool -L libsacore.dylib | tail -n +2 | grep -v libsacore \
+               | grep -vqE '^[[:space:]]+(/System/Library/Frameworks/|/usr/lib/libSystem)'; then
+            otool -L libsacore.dylib; echo "unexpected linkage"; exit 1; fi
+          python -c 'import sacore,time; assert sacore.lib; d=abs(sacore.now()-time.monotonic()); print("clock delta",d); assert d<1e-3'
+
+      - name: Install BlackHole 2ch (the pkg the app installs, checksum-verified)
+        run: |
+          url=$(sed -n 's/^BLACKHOLE_URL = "\(.*\)"/\1/p' app.py)
+          sum=$(sed -n 's/^BLACKHOLE_SHA256 = "\(.*\)"/\1/p' app.py)
+          curl -fsSL --retry 3 -o /tmp/blackhole.pkg "$url"
+          echo "$sum  /tmp/blackhole.pkg" | shasum -a 256 -c -
+          sudo installer -pkg /tmp/blackhole.pkg -target /
+
+      - name: Build the AirPods-like and speaker-like loopback twins (optional)
+        id: twins
+        continue-on-error: true
+        run: bash tests/coreaudio/build_twins.sh
+
+      - name: Restart CoreAudio, wait for the devices, check their facts
+        id: devices
+        run: |
+          sudo killall -9 coreaudiod || true      # launchd starts it again, with the new drivers
+          want=()
+          if [ "${{ steps.twins.outcome }}" = success ]; then want=(--want "SyncTestBT 2ch" "SyncTestSpk 2ch"); fi
+          python tests/coreaudio/wait_devices.py --need "BlackHole 2ch" "${want[@]}" --timeout 60 \
+            --json devices.json --github-output "$GITHUB_OUTPUT"
+
+      - name: Preflight - recording is allowed (macOS microphone permission) and BlackHole passes audio unchanged
+        run: python tests/coreaudio/run_all.py --only preflight --out preflight.json
+
+      - name: Real-CoreAudio engine and whole-app tests (release-blocking)
+        run: python tests/coreaudio/run_all.py --twins "${{ steps.devices.outputs.twins }}" --out coreaudio-results.json
+
+      - name: coreaudiod's own overload log
+        if: always()
+        run: |
+          log show --last 45m --info --style compact --predicate 'process == "coreaudiod" AND
+            (eventMessage CONTAINS[c] "overload" OR eventMessage CONTAINS[c] "skipping cycle")' > overloads.log || true
+          wc -l overloads.log
+          cp /tmp/bh-*.log . 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coreaudio-evidence
+          path: |
+            coreaudio-results.json
+            preflight.json
+            devices.json
+            overloads.log
+            bh-*.log
+            ca-*/**
+          if-no-files-found: ignore
+
   release:
-    needs: build          # only publish when both Macs built and passed every check
+    # only publish when every check passed: the Mac build, Linux, and real CoreAudio
+    needs: [build, linux-tests, realtime-audio]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
+          name: SyncAudio
           path: dmgs
-          merge-multiple: true
 
       - name: Publish the download page
         env:
@@ -167,6 +277,16 @@ jobs:
           [ -f dmgs/install.sh ] || mv dmgs/packaging/install.sh dmgs/install.sh
           ls -la dmgs/*.dmg dmgs/install.sh
           cat > notes.md <<'NOTES'
+          ## SyncAudio 2.0
+
+          A rebuilt audio engine: the part that feeds your speakers or headphones never waits for the
+          rest of the app, so a busy Mac can't cause static any more, and every Mac stays exactly in time.
+
+          - **Update every Mac to 2.0.** 1.x and 2.0 can't play together; the app tells you if the
+            other Mac needs updating (Settings → Check for updates).
+          - **The delay is longer with AirPods (about 0.6 s)**, so Wi-Fi hiccups are never heard.
+          - **New: Settings → Test my headphones** (30 s) shows whether macOS itself drops audio.
+
           ## Download
 
           **Install or update from Terminal** (both Macs):

@@ -1,24 +1,41 @@
 """Run the tests for the build.
 
 Two kinds of tests:
-- Checks of the logic (parsing, the player, the codec, the updater, ...): these
-  decide whether a build is released. A failure is run once more on its own; a
-  real bug fails both times and stops the release.
-- Simulations that play audio in real time between threads (fake AirPods, three
-  Macs in one process, Bonjour). On GitHub's shared Macs these sometimes miss by
-  a few milliseconds because the machine stalled, not because the app is wrong,
-  so they are run and their results printed, but they don't stop a release.
+- Checks that decide whether a build is released: the logic (parsing, the delay
+  policy, the codec, the updater, ...), the audio engine in virtual time, the
+  real-time tests judged only on what the machine can't fake (fake AirPods played
+  through libsacore's fake IO thread, its own late wake-ups allowed for), and the
+  Mac CI's real-CoreAudio scripts run through on fake loopback devices. A
+  failure is run once more on its own; a real bug fails both times and stops the
+  release.
+- Simulations of whole apps in real time (three Macs in one process, following
+  AirPods, Bonjour). On GitHub's shared Macs these sometimes miss because the
+  machine stalled, not because the app is wrong, so they are run and their
+  results printed, but they don't stop a release.
+
+First it builds libsacore (native/build.sh), the C code that runs on CoreAudio's IO
+threads, and every test uses that fresh build: on a Mac the one with the tests' fake IO
+thread, on Linux also the AddressSanitizer build.
 """
 import os
+import subprocess
 import sys
 import unittest
 
 here = os.path.dirname(os.path.abspath(__file__))
+root = os.path.dirname(here)
 sys.path.insert(0, here)
-sys.path.insert(0, os.path.dirname(here))
+sys.path.insert(0, root)
 
-REAL_TIME = {"EndToEndTest", "SlowWifiTest", "BluetoothAudioTest", "AirPodsTest",
-             "CombinedDeviceTest", "SessionTest", "TwoMacsTest", "BonjourRoundTripTest"}
+print("== Building libsacore ==", flush=True)
+build = subprocess.run(["bash", os.path.join(root, "native", "build.sh")], env={**os.environ, "SACORE_SANITIZE": "1"})
+if build.returncode:
+    print("native/build.sh failed: nothing can play without libsacore")
+    sys.exit(1)
+os.environ["SACORE_LIB"] = os.path.join(root, "libsacore_test.dylib" if sys.platform == "darwin" else "libsacore.so")
+
+REAL_TIME = {"EndToEndTest", "SlowWifiTest", "AirPodsTest", "CombinedDeviceTest", "SessionTest", "TwoMacsTest",
+             "BonjourRoundTripTest"}
 
 
 def tests(suite):

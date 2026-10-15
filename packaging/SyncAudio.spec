@@ -1,19 +1,20 @@
 # PyInstaller recipe for SyncAudio.app (run on a Mac, see .github/workflows/build-mac.yml):
-#   SWITCHAUDIO_BIN=/path/to/SwitchAudioSource pyinstaller --noconfirm packaging/SyncAudio.spec
+#   SACORE_LIB=$PWD/libsacore.dylib SWITCHAUDIO_BIN=/path/to/SwitchAudioSource pyinstaller --noconfirm packaging/SyncAudio.spec
 import os
 
 root = os.path.abspath(os.path.join(SPECPATH, ".."))
 version = os.environ.get("APP_VERSION", "1.0.0")
 switch = os.environ.get("SWITCHAUDIO_BIN")
 opus = os.environ.get("OPUS_LIB")      # libopus.0.dylib; the self-test fails without it
+sacore = os.environ["SACORE_LIB"]      # libsacore.dylib (native/build.sh): no sound at all without it
 
 a = Analysis(
     [os.path.join(root, "app.py")],
     pathex=[root],
-    binaries=([(switch, ".")] if switch else []) + ([(opus, ".")] if opus else []),
+    binaries=[(sacore, ".")] + ([(switch, ".")] if switch else []) + ([(opus, ".")] if opus else []),
     datas=[(os.path.join(root, "ui"), "ui")] + (
         [(os.path.join(root, "build_info.json"), ".")] if os.path.exists(os.path.join(root, "build_info.json")) else []),
-    hiddenimports=["webview.platforms.cocoa"],
+    hiddenimports=["webview.platforms.cocoa"],     # (sacore and audio_engine: app.py imports them)
     excludes=["tkinter", "matplotlib", "PIL"],
 )
 pyz = PYZ(a.pure)

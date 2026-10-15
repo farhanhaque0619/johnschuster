@@ -21,4 +21,5 @@ USING IT
 - Mac playing the music: click "Start sharing". The first time it offers to
   install BlackHole, a free audio driver; click Install and type your password.
 - Every other Mac: open SyncAudio and click "Join" next to the sharing Mac.
-- Any number of Macs can join. All of them need to be on the same Wi-Fi.
+- Any number of Macs can join. All of them need to be on the same Wi-Fi,
+  and all need SyncAudio 2.0 (it can't play together with 1.x).
