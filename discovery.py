@@ -3,19 +3,27 @@ Finding Macs that are sharing, on networks that make it hard.
 
 Three ways, used together:
   * Bonjour (macOS's dns-sd tool). The sharing Mac puts its network address in
-    the announcement. (It can also use the AirDrop link, but doesn't by default:
-    that link makes Wi-Fi hop channels and fails when it's turned off.)
+    the announcement.
   * A sweep of the whole local subnet (the real netmask, not just a /24),
     a chunk per scan, for networks that block broadcasts and Bonjour.
   * Addresses that worked before (remembered by the app).
+
+And when the Wi-Fi keeps devices apart (many school, office and guest networks
+show Macs to each other but drop every connection between them): the Macs' own
+peer-to-peer Wi-Fi link, the one AirDrop uses (p2p_hosts). It only comes up while
+someone asks for it - the sharing Mac announces itself on it while nobody is
+connected - because it makes Wi-Fi hop channels.
 """
 from __future__ import annotations
 
 import ipaddress
 import re
 import shutil
+import socket
 import subprocess
+import sys
 import threading
+import time
 
 SERVICE = "_syncaudio._tcp"            # a Mac that's sharing
 ROOM_SERVICE = "_syncaudio-room._tcp"  # any open SyncAudio 1.1+ (rooms)
@@ -23,6 +31,24 @@ P2P = ["-includep2p", "-includeAWDL"]    # also over AWDL, the AirDrop link (off
                                           # it makes Wi-Fi hop channels, which Bluetooth headphones
                                           # sharing the radio hear, and finds nothing when AWDL is off)
 SWEEP_CHUNK = 512                         # addresses per scan
+SO_RECV_ANYIF = 0x1104                    # macOS: let a socket use the peer-to-peer link (sys/socket.h)
+
+
+def allow_p2p(sock) -> bool:
+    """Let this socket send and receive over the AirDrop link (awdl0), which macOS keeps sockets
+    off by default. (A private option, but the only one BSD sockets have; harmless elsewhere.)"""
+    if sys.platform != "darwin":
+        return False
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, SO_RECV_ANYIF, 1)
+        return True
+    except OSError:
+        return False
+
+
+def is_p2p_interface(name: str | None) -> bool:
+    """The AirDrop link's interfaces: awdl0 (and llw0, its low-latency twin)."""
+    return bool(name) and name.startswith(("awdl", "llw"))
 
 
 def interface_for(ip: str, ifconfig_text: str | None = None):
@@ -81,16 +107,90 @@ def parse_resolve(text: str):
     return (ip.group(1) if ip else None, int(port.group(1)) if port else None)
 
 
+def parse_targets(text: str) -> list:
+    """Every (host, port, interface index) a `dns-sd -L` resolve reached the service on: one per
+    interface (Wi-Fi, the AirDrop link...)."""
+    return [(m.group(1), int(m.group(2)), int(m.group(3)))
+            for m in re.finditer(r"can be reached at (\S+?):(\d+) \(interface (\d+)\)", text)]
+
+
+def parse_addr6(text: str) -> list:
+    """IPv6 addresses from `dns-sd -G v6` output, as Python can connect to them ("fe80::1%awdl0")."""
+    out = []
+    for m in re.finditer(r"\b([0-9A-Fa-f]{4}(?::[0-9A-Fa-f]{4}){7})%(\S+)", text):
+        try:
+            addr = ipaddress.IPv6Address(m.group(1))
+        except ValueError:
+            continue
+        out.append(f"{addr.compressed}%{m.group(2)}" if addr.is_link_local else addr.compressed)
+    return out
+
+
+def _read(cmd: list, seconds: float, done=None) -> str:
+    """dns-sd's output for up to `seconds` (it never exits by itself), or until done(text) says enough."""
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return ""
+    timer = threading.Timer(seconds, proc.terminate)
+    timer.daemon = True
+    timer.start()
+    text = ""
+    try:
+        for line in proc.stdout:
+            text += line
+            if done and done(text):
+                break
+    finally:
+        timer.cancel()
+        proc.terminate()
+    return text
+
+
+def p2p_hosts(service: str = SERVICE, seconds: float = 3.0, names=None) -> list:
+    """Sharing Macs reachable over the AirDrop link: [{"name", "ip" (their Wi-Fi address), "address"
+    (on the link, "fe80::...%awdl0"), "port"}]. Asking brings the link up on this Mac for a moment.
+    `names`: only look these up (when we know whom we want)."""
+    tool = dns_sd()
+    if not tool:
+        return []
+    wanted = set(names) if names else None
+    found = []
+    if wanted is None:
+        browse = _read([tool, *P2P, "-B", service, "local"], seconds)
+        wanted = {p[1] for p in map(parse_browse_line, browse.splitlines()) if p and p[0] == "Add"}
+    for name in sorted(wanted):
+        text = _read([tool, *P2P, "-L", name, service, "local"], seconds)
+        ip, _ = parse_resolve(text)
+        for host, port, index in parse_targets(text):
+            try:
+                ifname = socket.if_indextoname(index)
+            except OSError:
+                continue
+            if not is_p2p_interface(ifname):
+                continue
+            out = _read([tool, *P2P, "-G", "v6", host], seconds, lambda t: "%" + ifname in t)
+            for address in parse_addr6(out):
+                if address.endswith("%" + ifname):
+                    found.append({"name": name, "ip": ip, "address": address, "port": port})
+                    break
+            break
+    return found
+
+
 class Advertiser:
-    """Announces this Mac while it shares. Over the AirDrop link only for the
-    first few minutes: that link makes Wi-Fi hop channels, which costs a little
-    latency, so it stops once people have had time to find this Mac."""
+    """Announces this Mac while it shares: on the Wi-Fi network, and (p2p) over the AirDrop link too,
+    for Wi-Fi that keeps devices apart. The sharing session switches the link on and off (set_p2p):
+    it makes Wi-Fi hop channels, so only while it may be needed. p2p_seconds: on for that long at
+    the start, then off."""
 
     P2P_SECONDS = 0
 
-    def __init__(self, name: str, port: int, ip: str, service: str = SERVICE, p2p_seconds: float = P2P_SECONDS):
+    def __init__(self, name: str, port: int, ip: str, service: str = SERVICE, p2p_seconds: float = P2P_SECONDS,
+                 p2p: bool = False):
         self.name, self.port, self.ip, self.service = name, port, ip, service
         self.p2p_seconds = p2p_seconds
+        self.p2p_start = p2p
         self.proc = None
         self.p2p = None
         self._stop = threading.Event()
@@ -114,8 +214,8 @@ class Advertiser:
             self.p2p = on
 
     def _run(self):
-        self.set_p2p(self.p2p_seconds > 0)
-        if self.p2p_seconds > 0 and not self._stop.wait(self.p2p_seconds):
+        self.set_p2p(self.p2p_start or self.p2p_seconds > 0)
+        if not self.p2p_start and self.p2p_seconds > 0 and not self._stop.wait(self.p2p_seconds):
             self.set_p2p(False)
 
     def stop(self):

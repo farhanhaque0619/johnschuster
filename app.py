@@ -39,7 +39,7 @@ import syncaudio as sa
 import updater
 
 APP_NAME = "SyncAudio"
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 DOWNLOAD_URL = "https://github.com/farhanhaque0619/johnschuster/releases/latest"
 BLACKHOLE_URL = "https://existential.audio/downloads/BlackHole2ch-0.7.1.pkg"
 BLACKHOLE_SHA256 = "57b540f27a3e29c37e310e01bee0fdfab76733087e47f997ef9dccf851400dcf"
@@ -391,12 +391,17 @@ class Controller:
                 time.sleep(1.0)
                 continue
             if self.browser is None:
-                self.browser = discovery.Browser().start()
+                # Also over the AirDrop link (only while idle: it makes Wi-Fi hop channels): on Wi-Fi that
+                # keeps devices apart, that's the only way the Macs find - and then reach - each other.
+                self.browser = discovery.Browser(p2p=True).start()
             if self.room and self.room_browser is None:
                 self.room_browser = discovery.Browser(service=discovery.ROOM_SERVICE).start()
             browser = self.browser
             ip = sa.lan_ip()
             if ip != sweep_ip:
+                if sweep_ip is not None and self.browser:   # another network: what Bonjour knew is stale
+                    self.browser.stop()
+                    self.browser = browser = discovery.Browser(p2p=True).start()
                 sweep_ip, sweep, broadcast = ip, None, None
                 iface = discovery.interface_for(ip)
                 if iface:
@@ -425,6 +430,7 @@ class Controller:
                     by_name[name] = address
             for name, address in list(browser.found.items()):
                 by_name.setdefault(name, address)
+            by_name.pop(self.name, None)        # (this Mac's own share, or an old announcement of it)
             nearby = {}
             for agent in agents:
                 if agent["id"] == self.device_id:
@@ -628,11 +634,14 @@ class Controller:
             self._stop_session()
             self.error = None
             probes = (ae.GcTimer(), ae.GilProbe())
+            # Its Bonjour name, if it's one we've seen: on Wi-Fi that keeps devices apart, the address won't
+            # answer and the name is how it's found over the AirDrop link instead.
+            label = next((n["name"] for n in self.nearby if n.get("address") == address), None)
             try:
                 self.refresh_devices()      # the output macOS plays on now (AirPods put in since), not at launch
                 session = sa.JoinSession(self.sd, address, self.name, settings=self.settings,
                                          port=port or self.port, switch_tool=self.switch_tool, log=self._log,
-                                         devices=self.prefs["devices"], probes=probes)
+                                         devices=self.prefs["devices"], probes=probes, host_label=label)
                 session.from_room = from_room
                 session.start()
             except Exception as e:
@@ -876,6 +885,9 @@ class Controller:
                           f"gap {cap.get('cap_gap_frames')} frames reader max {cap.get('cap_reader_max_ms')} ms "
                           f"dll {cap.get('cap_dll_ppm')} ppm" if cap else "capture: test clicks")
                          + f" | level {s.get('level')} silent {s.get('silent_s')} s")
+            link = s.get("direct_link") or {}
+            lines.append(f"direct Wi-Fi link: {'announced' if link.get('announced') else 'off'}, "
+                         f"ipv6 {link.get('ipv6')}, allowed {link.get('allowed')}")
             for l in s.get("listeners", []):
                 if l.get("old"):
                     lines.append(f"listener {l.get('name')} has SyncAudio {l.get('version')}: it needs 2.0 to play")
@@ -886,7 +898,9 @@ class Controller:
                          f"wifi {l.get('wifi_ms')} ms, late {l.get('late')}, unsent {l.get('unsent')} B)")
                 lines += player_summary(label, l, past, delay)
         elif s:
-            label = (f"listening to {s.get('host_name')} (v{s.get('host_version')}, {s.get('connection')}, "
+            label = (f"listening to {s.get('host_name') or s.get('host_label')} at {s.get('address')} "
+                     f"(v{s.get('host_version')}, {s.get('connection')}, via {s.get('route')}"
+                     f"{' ' + s['direct_address'] if s.get('direct_address') else ''}, "
                      f"{s.get('codec')}, wifi {s.get('wifi_ms')} ms, silent {s.get('incoming_silent_s')} s)")
             lines += player_summary(label, s, [(h["t"], h) for h in history if h.get("mode") == "listening"], delay)
             if s.get("problem"):

@@ -162,9 +162,11 @@ class AppTest(unittest.TestCase):
                                r"delay \d+ ms \(\d+ steps, \d+ glides\)\n"
                                r"  static check: \d+ skipped cycles / 0 overloads in the last \d+ s$")
         self.assertRegex(text, r"(?m)^capture BlackHole 2ch io 512 skips \d+ ")
-        self.assertRegex(text, r"(?m)^listener Sam \(v2\.0\.0, \w+, wifi [\d.]+ ms, late \d+, unsent \d+ B\): "
+        self.assertRegex(text, r"(?m)^direct Wi-Fi link: (announced|off), ipv6 (True|False), allowed (True|False)$")
+        self.assertRegex(text, r"(?m)^listener Sam \(v[\d.]+, \w+, wifi [\d.]+ ms, late \d+, unsent \d+ B\): "
                                r"out MacBook Pro Speakers io 1024 ")
-        self.assertRegex(sam.summary(listening), r"(?m)^listening to Den \(v2\.0\.0, connected, \w+, wifi [\d.]+ ms, "
+        self.assertRegex(sam.summary(listening), r"(?m)^listening to Den at \S+ \(v[\d.]+, connected, via network, "
+                                                 r"\w+, wifi [\d.]+ ms, "
                                                  r"silent [\d.]+ s\): out MacBook Pro Speakers io 1024 .*\n"
                                                  r"  static check: ")
 

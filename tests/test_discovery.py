@@ -166,10 +166,13 @@ class ProbeTest(unittest.TestCase):
 
 class QuitTest(unittest.TestCase):
     def test_quitting_stops_the_background_search(self):
-        stopped = []
+        started, stopped = [], []
 
         class FakeBrowser:
             found = {}
+
+            def __init__(self, **options):
+                started.append(options)
 
             def start(self):
                 return self
@@ -182,7 +185,9 @@ class QuitTest(unittest.TestCase):
             c = app.Controller(sd=FakeSoundDevice(), prefs_file=Path(tempfile.mkdtemp()) / "p.json", port=free_port())
             self.assertTrue(wait_until(lambda: c.browser is not None, 5))
             c.shutdown()
-        self.assertEqual(stopped, [True], "dns-sd must not outlive the app")
+        self.assertTrue(started)
+        self.assertEqual(len(stopped), len(started), "dns-sd must not outlive the app")
+        self.assertTrue(started[0].get("p2p"), "while idle it also looks over the AirDrop link")
 
 
 class DiagnosticsTest(unittest.TestCase):

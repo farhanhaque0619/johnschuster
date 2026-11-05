@@ -833,6 +833,8 @@ class Host:
         self._gain = 1.0            # what was applied to the last block
         self._encoder = None        # Opus, made when the first Mac that can decode it joins
         self._told_old: set = set()
+        self.p2p_ok = False         # the IPv6 sockets may use the AirDrop link (discovery.allow_p2p)
+        self.tcp6 = self.udp6 = None
         self.running = False
 
     @property
@@ -855,22 +857,48 @@ class Host:
             self.tcp.close()
             self.udp.close()
             raise
+        self.tcp6, self.udp6 = self._open_v6()
         # Blocking calls don't notice a socket being closed under them, so the
         # loops wake up regularly to check whether they should stop.
-        self.tcp.settimeout(0.5)
-        self.udp.settimeout(0.5)
+        for sock in self._sockets():
+            sock.settimeout(0.5)
         self.running = True
-        self._threads = [threading.Thread(target=self._accept_loop, daemon=True),
-                         threading.Thread(target=self._udp_loop, daemon=True)]
+        self._threads = [threading.Thread(target=self._accept_loop, args=(t,), daemon=True)
+                         for t in (self.tcp, self.tcp6) if t] + \
+                        [threading.Thread(target=self._udp_loop, args=(u,), daemon=True)
+                         for u in (self.udp, self.udp6) if u]
         for t in self._threads:
             t.start()
+
+    def _open_v6(self):
+        """The same port over IPv6, which is what the AirDrop link speaks: listeners on Wi-Fi that keeps
+        devices apart come in that way (discovery.p2p_hosts). Optional: (None, None) without IPv6."""
+        socks = []
+        try:
+            for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+                s6 = socket.socket(socket.AF_INET6, kind)
+                socks.append(s6)
+                s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                self.p2p_ok = discovery.allow_p2p(s6)
+                s6.bind(("::", self.port))
+                if kind == socket.SOCK_STREAM:
+                    s6.listen()
+            return socks[0], socks[1]
+        except OSError:
+            for s6 in socks:
+                s6.close()
+            return None, None
+
+    def _sockets(self):
+        return [s for s in (self.tcp, self.udp, getattr(self, "tcp6", None), getattr(self, "udp6", None)) if s]
 
     def stop(self):
         """Stop serving; the port is free again once this returns."""
         self.running = False
         for t in getattr(self, "_threads", []):
             t.join(timeout=2)
-        for s in (self.tcp, self.udp):
+        for s in self._sockets():
             try:
                 s.close()
             except OSError:
@@ -955,25 +983,25 @@ class Host:
             out.append(info)
         return out
 
-    def _udp_loop(self):
+    def _udp_loop(self, udp):
         while self.running:
             try:
-                data, addr = self.udp.recvfrom(512)
+                data, addr = udp.recvfrom(512)
                 t2 = self.now()
                 if len(data) == PING.size and data[:1] == b"P":
                     _, seq, t1 = PING.unpack(data)
-                    self.udp.sendto(PONG.pack(b"Q", seq, t1, t2, self.now()), addr)
+                    udp.sendto(PONG.pack(b"Q", seq, t1, t2, self.now()), addr)
                 elif data == DISCOVER:
-                    self.udp.sendto(b"d" + json.dumps({"name": self.name, "port": self.port, "version": APP_VERSION,
-                                                       "proto": PROTO}).encode(), addr)
+                    udp.sendto(b"d" + json.dumps({"name": self.name, "port": self.port, "version": APP_VERSION,
+                                                  "proto": PROTO}).encode(), addr)
             except OSError:
                 if not self.running:
                     return
 
-    def _accept_loop(self):
+    def _accept_loop(self, tcp):
         while self.running:
             try:
-                sock, addr = self.tcp.accept()
+                sock, addr = tcp.accept()
             except socket.timeout:
                 continue
             except OSError:
@@ -1126,6 +1154,32 @@ def explain(e: BaseException) -> dict:
     return {"code": "other", "message": f"Couldn't connect ({e})."}
 
 
+def isolated(name: str) -> dict:
+    return {"code": "isolated", "message": (
+        f"This Wi-Fi network keeps devices apart: it shows {name} to this Mac but drops every connection "
+        "between them (common on school, guest and office Wi-Fi). SyncAudio also tried the Macs' own direct "
+        "Wi-Fi link (the one AirDrop uses) and couldn't get through: keep Wi-Fi and Bluetooth on and the Macs "
+        "within a few metres. Or put both Macs on a network that lets devices talk to each other: the Wi-Fi "
+        "where this worked before, or a home router. (A phone's hotspot may not: iPhones often keep devices "
+        "apart too.)")}
+
+
+def connect(ip: str, port: int, timeout: float = 3.0) -> socket.socket:
+    """TCP to `ip`: an IPv4 address, or IPv6 such as the host's on the AirDrop link ("fe80::...%awdl0")."""
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    addr = socket.getaddrinfo(ip, port, family, socket.SOCK_STREAM)[0][4]
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    if family == socket.AF_INET6:
+        discovery.allow_p2p(sock)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(addr)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
 def probe(address: str, port: int = PORT, seconds: float = 2.0) -> dict:
     """Check a sharing Mac step by step: answers discovery, accepts the
     connection, streams audio, answers clock pings."""
@@ -1189,8 +1243,11 @@ class Client:
 
     def __init__(self, host: str | None, open_output, port: int = PORT, name: str = "friend",
                  settings: Settings | None = None, log=print, now=time.monotonic,
-                 discover_address: str | None = None, hint=dict, probes=()):
+                 discover_address: str | None = None, hint=dict, probes=(), host_label: str | None = None):
         self.host, self.open_output, self.port, self.name = host, open_output, port, name
+        self.host_label = host_label    # its Bonjour name: looked for over the AirDrop link if `host` won't answer
+        self.route = None               # how we got through: "network", or "direct" (the AirDrop link)
+        self._direct = None             # its address on the AirDrop link, once found
         self.settings = settings or Settings()
         self.log, self.now, self.discover_address, self.hint = log, now, discover_address, hint
         self.probes = probes            # Python's own stalls, sent in each second's STATS
@@ -1276,13 +1333,13 @@ class Client:
                 ip, self.host_name = found
             try:
                 self.phase = "connecting"
-                self._session(ip)
+                self._connect_any(ip)
             except OldHost:
                 wait = self.OLD_HOST_RETRY      # (each try shows up on that Mac as a join)
             except (OSError, ValueError, KeyError, ConnectionError) as e:
                 if self.running and self.phase == "connected":
                     self.log(f"lost the host ({e}); reconnecting...")
-                elif isinstance(e, OSError):
+                elif isinstance(e, OSError) and not (self.problem and self.problem.get("code") == "isolated"):
                     self.problem = explain(e)
             except Exception as e:  # e.g. the speaker can't be opened
                 self.error = str(e)
@@ -1292,8 +1349,49 @@ class Client:
                 self.phase = "retrying" if self.host else "searching"
                 time.sleep(wait)
 
-    def _session(self, ip: str):
-        sock = socket.create_connection((ip, self.port), timeout=3)
+    def _connect_any(self, ip: str):
+        """The host's network address; if that doesn't take a connection, the AirDrop link (Wi-Fi that
+        keeps devices apart shows Macs to each other but drops every connection between them)."""
+        try:
+            sock, self.route = connect(ip, self.port, timeout=3), "network"
+        except OSError as e:
+            if ":" in ip:
+                raise                       # (already the link, or IPv6 typed in)
+            direct = self._direct or self._find_direct(ip)
+            if not direct:
+                self._explain_isolated(e)
+                raise
+            try:
+                sock, self.route = connect(direct, self.port, timeout=3), "direct"
+            except OSError:
+                self._direct = None         # (looked up afresh next time)
+                self._explain_isolated(e)
+                raise e from None
+            if not self._direct:
+                self.log(f"{ip} doesn't answer: connecting over the direct Wi-Fi link ({direct})")
+                self.event("direct_link", address=direct)
+            self._direct, ip = direct, direct
+        return self._session(ip, sock)
+
+    def _find_direct(self, ip: str):
+        """The host's address on the AirDrop link, by its Bonjour name (or the network address it
+        announces). None if it isn't there (or this isn't a Mac)."""
+        if not discovery.dns_sd():
+            return None
+        hosts = discovery.p2p_hosts(names=[self.host_label] if self.host_label else None, seconds=2.5)
+        for h in hosts:
+            if h["name"] == self.host_label or h["ip"] == ip or len(hosts) == 1:
+                return h["address"]
+        return None
+
+    def _explain_isolated(self, e: OSError):
+        if self.host_label and (isinstance(e, socket.timeout) or getattr(e, "errno", None) in
+                                (errno.ETIMEDOUT, errno.EHOSTUNREACH, getattr(errno, "EHOSTDOWN", -1))):
+            self.problem = isolated(self.host_label)
+        else:
+            self.problem = explain(e)
+
+    def _session(self, ip: str, sock: socket.socket):
         self._conn = sock
         stop = threading.Event()
         try:
@@ -1382,11 +1480,15 @@ class Client:
     def _ping_loop(self, ip: str, stop: threading.Event):
         started = self.now()
         seq = 0
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        with socket.socket(family, socket.SOCK_DGRAM) as s:
+            if family == socket.AF_INET6:
+                discovery.allow_p2p(s)
+            dest = socket.getaddrinfo(ip, self.port, family, socket.SOCK_DGRAM)[0][4]
             while not stop.is_set():
                 seq += 1
                 try:
-                    s.sendto(PING.pack(b"P", seq, self.now()), (ip, self.port))
+                    s.sendto(PING.pack(b"P", seq, self.now()), dest)
                     s.settimeout(0.25)
                     while True:
                         data = s.recv(64)
@@ -1684,8 +1786,9 @@ class HostSession(_Session):
             self.stop()
             raise
         self.started = time.monotonic()
-        # Never over the AirDrop link while sharing: it makes Wi-Fi hop channels and stall (dropouts).
-        self.advertiser = discovery.Advertiser(self.name, self.port, lan_ip(), p2p_seconds=0).start()
+        # Also announced over the AirDrop link while nobody is connected (see _second), for Wi-Fi that
+        # keeps devices apart; off once everyone is in over the network: it makes Wi-Fi hop channels.
+        self.advertiser = discovery.Advertiser(self.name, self.port, lan_ip(), p2p=True).start()
         threading.Thread(target=self._tick_loop, name="host-tick", daemon=True).start()
         return self
 
@@ -1728,7 +1831,10 @@ class HostSession(_Session):
                     self._act(act, self.output, self.event, self._reopen_output)
             if isinstance(self.source, ae.AudioInput):
                 self._watch_capture(time.monotonic())
-        listeners = [l for l in self.host.listeners() if not l["old"]]
+        everyone = self.host.listeners()
+        if self.advertiser:     # the AirDrop link: while nobody's in, or someone came in over it
+            self.advertiser.set_p2p(not everyone or any(":" in (l.get("ip") or "") for l in everyone))
+        listeners = [l for l in everyone if not l["old"]]
         for l in listeners:
             if l.get("lead_ms") is not None:
                 self.peer_leads[l["name"]] = {"lead_ms": l["lead_ms"], "seen": round(time.time())}
@@ -1937,6 +2043,9 @@ class HostSession(_Session):
             "capture_glitches": self.cap_report.get("cap_overflows", 0) + self.cap_report.get("cap_skips", 0),
             "listeners": h.listeners(),
             "audio": {"output": out.info() if out else None},
+            # the AirDrop link (Wi-Fi that keeps devices apart): announced on it now / its sockets allowed on it
+            "direct_link": {"announced": bool(self.advertiser and self.advertiser.p2p), "ipv6": bool(h.tcp6),
+                            "allowed": h.p2p_ok},
             "events": list(h.events),
         }
 
@@ -1968,8 +2077,9 @@ class JoinSession(_Session):
 
     def __init__(self, sd, address: str | None, name: str, output_query: str | None = None,
                  settings: Settings | None = None, port: int = PORT, switch_tool: str | None = None,
-                 log=print, devices: dict | None = None, probes=()):
+                 log=print, devices: dict | None = None, probes=(), host_label: str | None = None):
         self.sd, self.address, self.name, self.output_query = sd, address, name, output_query
+        self.host_label = host_label    # the host's Bonjour name, if we saw it (for the direct link)
         self.settings = settings or Settings()
         self.port, self.switch_tool, self.log = port, switch_tool, log
         self.devices = {} if devices is None else devices
@@ -1985,7 +2095,7 @@ class JoinSession(_Session):
         self._seen_output = self.output_name
         self.system = SystemOutput(self.log, self.switch_tool)
         self.client = Client(self.address, self._open_output, self.port, self.name, self.settings, log=self.log,
-                             hint=self._hint, probes=self.probes)
+                             hint=self._hint, probes=self.probes, host_label=self.host_label)
         self.client.start()
         threading.Thread(target=self._tick_loop, name="join-tick", daemon=True).start()
         return self
@@ -2090,6 +2200,7 @@ class JoinSession(_Session):
         return {
             "mode": "listening", "address": self.address, "host_name": c.host_name, "host_version": c.host_version,
             "connection": c.phase, "output": self.output_name, "error": c.error, "problem": c.problem,
+            "route": c.route, "direct_address": c._direct, "host_label": self.host_label,
             "delay_ms": round(c.delay * 1000) if c.delay is not None else None,
             "group_volume": c.group_volume, "group_volume_by": c.group_volume_by,
             "clock": c.clock.estimate is not None, **c.stats(),

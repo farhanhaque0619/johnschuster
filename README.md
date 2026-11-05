@@ -132,6 +132,13 @@ going, so everyone else still hears it.
 * **"Can't reach …" when joining.** The app says why underneath: wrong address,
   the network keeping devices apart, the Mac not sharing, or macOS blocking
   local-network access.
+* **"This Wi-Fi network keeps devices apart".** Many school, guest and office
+  networks show Macs to each other but block every connection between them.
+  SyncAudio then tries the Macs' own direct Wi-Fi link (the one AirDrop uses):
+  keep Wi-Fi and Bluetooth on and the Macs within a few metres. If that doesn't
+  get through either, put both Macs on a network that lets devices talk to each
+  other: the Wi-Fi where SyncAudio worked before, or a home router. (A phone's
+  hotspot may not: iPhones often keep devices apart too.)
 * **"… needs updating" or "Different versions".** SyncAudio 2.0 can't play
   together with 1.x. Update the other Mac (**Settings → Check for updates**, or
   the Terminal line under [Updating](#updating)).
