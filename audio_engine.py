@@ -511,8 +511,14 @@ class OutputEngine:
         recs = self.ring.new_records()
         if len(recs):
             self._callbacks(recs)
+        t0 = self.now()
         st = self.ring.state()
-        self._state_t = self.now()              # when r (where the device is) was read
+        t1 = self.now()
+        # When r (where the device is) was read. Python may hand the GIL to another thread between the
+        # read and the clock (inside state(), after the C call): then t1 is late by however long that
+        # thread kept it - up to the 200 ms stalls `unexplained` is about - and the next dry ring would
+        # look as if it came too soon. Not known then: that one isn't judged.
+        self._state_t = t1 if t1 - t0 < 0.002 else None
         self._count(st, now)
         if self.clock.ready:
             # The arrival edge, read once a tick: each call into C lets go of the GIL, and under load

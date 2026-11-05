@@ -234,6 +234,35 @@ class StallTest(unittest.TestCase):
         r = self.mac.judge(vd.steady(T0, 0.5), T0 + 6.45 + 0.5, T0 + 13.5)
         self.assertLessEqual(r["err_max_ms"], 0.05, r)
         self.assertEqual(r["glitches"], 0, r)
+        self.assertEqual(e.unexplained, 0)                      # Python held it up longer than it had
+
+    def test_python_held_up_right_after_reading_the_ring_is_no_bug(self):
+        """The GIL can go to another thread just after the C read (inside ring.state()) and before the
+        clock is read: that tick's clock is late by the stall. The dry ring after it is still the
+        stall's, not 'back in time and dry anyway' (CI's P3 under GIL stress: 1 in ~15)."""
+        sim = vd.Sim()
+        at = 1000.0 + 6.0
+        self.mac = m = Mac(sim, 14, stalls=[(at, 0.45)])
+        T0 = sim.t
+        vd.Feeder(sim, m.sb, T0, delay=lambda n: 0.5, net=0.005)
+        e, late = m.engine, []
+        now, ring = e.now, e.ring
+
+        class HeldAfterRead:            # the last tick before the stall loses the GIL after the read
+            def __getattr__(self, name):
+                return getattr(ring, name)
+
+            def state(self):
+                st = ring.state()
+                if sim.t < at <= sim.t + ae.OutputEngine.TICK:
+                    late.append(0.25)
+                return st
+        e.ring = HeldAfterRead()
+        e.now = lambda: now() + (late.pop() if late else 0.0)
+        sim.run(14)
+        st = e.second()
+        self.assertEqual((st["underruns"], e.reseeks), (1, 1), st)
+        self.assertEqual(e.unexplained, 0)
 
     def test_a_stall_of_this_macs_python_is_counted_once(self):
         # One GIL: the network thread stalls with the engine (and catches up a tick later), so what has

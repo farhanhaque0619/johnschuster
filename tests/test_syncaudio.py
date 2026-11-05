@@ -1111,6 +1111,35 @@ class AirPodsTest(unittest.TestCase):
                     join.stop()
                     host.stop()
 
+    def test_airpods_put_in_mid_song_get_their_room_at_once(self):
+        """The music never pauses (a steady tone): the host makes room for the AirPods within ~2 s of
+        the move - the new output's lead goes to the host at once, and the step doesn't wait for a
+        gap between songs. (It used to take 6-7 s, played close to running dry: CI's P5.)"""
+        port = free_port()
+        with hermetic():
+            host = sa.HostSession(FakeSoundDevice(), "Den", click=True, tone=True, port=port, log=quiet).start()
+            sd, state = FakeSoundDevice(), {"output": "MacBook Pro Speakers"}
+            with self.fake_switch_tool(state):
+                join = sa.JoinSession(sd, "127.0.0.1", "Sam", port=port, switch_tool="SwitchAudioSource",
+                                      log=quiet).start()
+                try:
+                    self.assertTrue(wait_until(lambda: join.info()["state"] == "in_sync"))
+                    time.sleep(2.0)                     # (the join on the speakers is long settled)
+                    before = [e for e in host.info()["events"] if e["event"] == "delay_change"]
+                    moved = time.monotonic()
+                    self.connect_airpods(sd, state)
+
+                    def stepped():
+                        return [e for e in host.info()["events"] if e["event"] == "delay_change"][len(before):]
+                    self.assertTrue(wait_until(stepped, 10), host.info()["events"])
+                    took = time.monotonic() - moved
+                    self.assertEqual([(e["request"], e["mode"]) for e in stepped()], [("join", "join")])
+                    self.assertLess(took, 3.5, stepped())
+                    self.assertGreaterEqual(host.info()["delay_ms"], 590)
+                finally:
+                    join.stop()
+                    host.stop()
+
     def test_sharing_mac_whose_airpods_vanish_plays_on_its_speakers(self):
         # AirPods back in their case: macOS's output stays BlackHole (sharing), so only the watchdog sees it
         sd, state = FakeSoundDevice(), {"output": "MacBook Pro Speakers"}

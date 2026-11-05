@@ -569,6 +569,27 @@ def p8b(ctx, d, c):
       [cap.get("cap_skips"), cap.get("cap_overflows")])
 
 
+TIMELINE = ("output", "delay_ms", "lead_ms", "ahead_ms", "ring_lead_min_ms", "headroom_min_ms", "spare_1s_ms",
+            "deficit_ms", "producer_max_ms", "underruns", "underrun_ms", "reseeks", "unexplained", "splices",
+            "dll_reanchors", "err_ms", "skips")
+
+
+def switch_timeline(jrep: list, hrep: list, flip_t: float, before: float = 2.0, after: float = 8.0) -> list:
+    """The listener's second-by-second numbers around an output switch (s from the switch), and the host's
+    delay: what a failed P5 needs to say why the new output ran dry."""
+    host = [(line["t"], line["info"].get("delay_ms"), line["info"].get("delay_target_ms")) for line in hrep]
+    rows = []
+    for line in jrep:
+        t = line["t"] - flip_t
+        if not -before <= t <= after:
+            continue
+        info = line["info"]
+        hd = min(host, key=lambda h: abs(h[0] - line["t"]), default=(None, None, None))
+        rows.append({"s": round(t, 2), **{k: info.get(k) for k in TIMELINE}, "host_delay_ms": hd[1],
+                     "host_target_ms": hd[2]})
+    return rows
+
+
 def p5(ctx, d, c):
     ctx.flip(SPK)
     try:
@@ -590,7 +611,14 @@ def p5(ctx, d, c):
     js = must(judge.clicks(rs.rec, stamps, heard_strlat(rs.rec), spk[0] + ctx.s(3.0), flip_t + 2.0))
     jb_all = must(judge.clicks(rb.rec, stamps, heard_strlat(rb.rec), bt[0] + 0.01, bt[1] - 0.5))   # (its fade-in)
     jb = must(judge.clicks(rb.rec, stamps, heard_strlat(rb.rec), bt[0] + 3.0, bt[1] - 0.5))
-    c.numbers.update(spk=js, bt=jb, bt_whole=jb_all, reopen_s=took, first_sound_after_flip_s=round(bt[0] - flip_t, 3))
+    c.numbers.update(spk=js, bt=jb, bt_whole=jb_all, reopen_s=took, first_sound_after_flip_s=round(bt[0] - flip_t, 3),
+                     bt_sound=[round(bt[0] - flip_t, 3), round(bt[1] - flip_t, 3)],
+                     holes_after_flip=[[round(e["t"] - flip_t, 3), e["ms"]] for e in jb_all["events"]],
+                     timeline=switch_timeline(jrep, hrep, flip_t),
+                     events_after_flip=sorted(({**e, "s": round(e["t"] - flip_wall, 2)} for e in
+                                               [*jrep[-1]["info"].get("events", []), *steps(hrep)]
+                                               if isinstance(e.get("t"), (int, float)) and e["t"] >= flip_wall - 2),
+                                              key=lambda e: e["s"]))
     ex_s, ex_b = excused({}, rs.rec)[1], excused({}, rb.rec)[1]
     c("at most one faded gap on SyncTestSpk 2ch (where it stopped)",
       js["holes"] + js["discontinuities"] <= 1 + ex_s, [js["events"], ex_s])
@@ -673,6 +701,14 @@ def phase(ctx, name: str) -> dict:
         for item in c.items:
             print(f"    [{'ok' if item['ok'] else 'XX'}] {item['check']}: {json.dumps(item['value'], default=str)[:300]}",
                   flush=True)
+        if not c.ok:        # (the artifact has everything; the log is what can always be read)
+            for key in ("bt_sound", "holes_after_flip", "reopen_s"):
+                if key in c.numbers:
+                    print(f"    {key}: {json.dumps(c.numbers[key], default=str)}", flush=True)
+            for row in c.numbers.get("timeline", []):
+                print(f"    | {json.dumps(row, default=str)}", flush=True)
+            for e in c.numbers.get("events_after_flip", []):
+                print(f"    > {json.dumps(e, default=str)[:400]}", flush=True)
         if c.ok:
             break
     ok = attempts[-1]["ok"]

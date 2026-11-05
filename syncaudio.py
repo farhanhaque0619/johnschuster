@@ -377,17 +377,19 @@ class DelaySchedule:
     """When the host's delay changes: on one exact block, so every Mac changes at the same sample
     (each block carries its own play_at). Runs on the capture thread, once per block. A change waits
     for a moment nobody would hear it:
-      raise, join, manual   the first silent block after 0.3 s of silence (a gap between songs)
+      raise, manual         the first silent block after 0.3 s of silence (a gap between songs)
       lower                 only inside a silence longer than what it removes, plus 0.3 s
-      urgent                at once: someone is already running out of audio
+      urgent, join          at once: someone is already running out of audio, or a Mac whose output
+                            takes longer to the ear (AirPods put in) is playing without the room it
+                            needs - waiting seconds for a silence is how it ran dry (CI's P5)
     A raise that finds no silence in 5 s glides instead: every block 0.25 % later until it's there
-    (4 cents; nobody hears it). A join or manual change becomes one short faded step (3-5 s); a lower
-    that finds no long enough silence in 10 minutes is dropped, and any other request replaces it."""
+    (4 cents; nobody hears it). A manual change becomes one short faded step (3 s); a lower that
+    finds no long enough silence in 10 minutes is dropped, and any other request replaces it."""
 
     GLIDE = 0.0025
     SILENT_PEAK = 1e-3          # -60 dBFS
     SILENT_RAISE = 0.30
-    WAIT = {"urgent": 0.0, "join": 5.0, "raise": 5.0, "manual": 3.0, "lower": 600.0}
+    WAIT = {"urgent": 0.0, "join": 0.0, "raise": 5.0, "manual": 3.0, "lower": 600.0}
 
     def __init__(self, d: float, on_change=lambda event, **fields: None):
         self.d = d
@@ -471,7 +473,8 @@ class DelayPolicy:
     every player's report (its own and each listener's STATS); answers at most one Request for the
     DelaySchedule:
       urgent  a player ran dry or lost audio: up at once (a short faded pause), by what it lacked
-      join    a newcomer whose output needs more (AirPods: ~0.2 s to the ear) - before it plays
+      join    a newcomer, or a Mac that moved to an output that needs more (AirPods: ~0.2 s to the
+              ear): up at once, one short faded step, so it never plays for long without that room
       raise   over the last 30 s someone came within MARGIN of running dry (a close call is no reason
               for an audible step: this waits for a silence, or glides)
       lower   after 5 calm minutes with plenty spare, and no raise for 10 minutes: a little, in a silence
@@ -1261,6 +1264,7 @@ class Client:
         self.group_volume = None
         self.group_volume_by = None
         self.report: dict = {}          # the last second's numbers (sent as STATS)
+        self._stats_now = False         # send STATS with the next block (a new output's lead)
         self.events: deque = deque(maxlen=200)
         self._sock = None
         self._conn = None               # the connection, from before the host answers (stop() cuts it)
@@ -1317,6 +1321,10 @@ class Client:
             if self.player:
                 self.output = self.open_output(self.player.rate, self.player.channels, self.player,
                                                reason=reason, level=level)
+        # The new output's lead now, not at the next second's STATS: AirPods need more delay than the
+        # speakers had, and until the host has made that room they play close to running dry. (Sent by
+        # the connection's loop with its next block: only that thread makes the STATS.)
+        self._stats_now = True
 
     def watchdog(self):
         with self._output_lock:
@@ -1454,8 +1462,8 @@ class Client:
                     if "group_volume" in update:
                         self.group_volume = float(update["group_volume"])
                         self.group_volume_by = update.get("by")
-                if self.now() - last_stats >= 1.0:
-                    last_stats = self.now()
+                if self.now() - last_stats >= 1.0 or self._stats_now:
+                    last_stats, self._stats_now = self.now(), False
                     self._send(STATS, self.second())
         finally:
             stop.set()

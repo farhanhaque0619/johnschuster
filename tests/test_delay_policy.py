@@ -409,14 +409,22 @@ class ScheduleTest(unittest.TestCase):
         self.assertEqual([kind for kind, _ in self.events], ["delay_change", "glide_done"])
         self.assertEqual(self.events[0][1]["mode"], "glide")
 
-    def test_join_and_manual_step_at_their_deadline_without_a_gap(self):
-        for mode, wait in (("join", 5.0), ("manual", 3.0)):
-            self.events.clear()
-            self.s.request(sa.Request(mode, 0.05), self.t)
-            d = self.delays(self.blocks(wait + 1.0))
-            first = int(np.argmax(np.abs(d - d[0]) > 0.01))
-            self.assertAlmostEqual(first * BLOCK_S, wait, delta=0.011)
-            self.assertEqual(self.changes()[0][0], mode)                # a short faded step, on every Mac alike
+    def test_manual_steps_at_its_deadline_without_a_gap(self):
+        self.s.request(sa.Request("manual", 0.05), self.t)
+        d = self.delays(self.blocks(4.0))
+        first = int(np.argmax(np.abs(d - d[0]) > 0.01))
+        self.assertAlmostEqual(first * BLOCK_S, 3.0, delta=0.011)
+        self.assertEqual(self.changes()[0][0], "manual")                # a short faded step, on every Mac alike
+
+    def test_a_join_steps_at_once_even_without_a_gap(self):
+        """AirPods put in mid-song: until the room is made they play close to running dry, so the step
+        doesn't wait for a gap between songs (CI's P5: in the 5 s it used to, they ran dry)."""
+        before = self.s.d
+        self.s.request(sa.Request("join", 0.14), self.t)
+        d = self.delays(self.blocks(0.05))
+        self.assertAlmostEqual(d[0] - before, 0.14)                     # the very next block
+        self.assertEqual(self.changes()[0][0], "join")
+        self.assertFalse(self.s.busy)
 
     def test_urgent_is_at_once_and_ends_a_glide(self):
         self.s.request(sa.Request("raise", 0.2), self.t)
