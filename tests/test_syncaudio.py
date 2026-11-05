@@ -1308,6 +1308,34 @@ class CaptureRecoveryTest(unittest.TestCase):
 class StopTest(unittest.TestCase):
     """Stop while a session thread is half way through something: nothing may happen after it."""
 
+    def test_a_listener_stopped_while_connected_has_no_problem_to_show(self):
+        """stop() cuts the connection itself: that isn't "Couldn't connect (connection closed)". (Whether
+        it showed depended on audio still being buffered at that moment: CI's direct-link test.)"""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        done = threading.Event()
+
+        def silent_host():                  # answers HELLO, then sends nothing: the listener waits in recv
+            conn, _ = srv.accept()
+            sa.recv_frame(conn)
+            conn.sendall(sa.frame(sa.HEADER, json.dumps({"rate": 48000, "channels": 2, "delay": 0.45, "name": "Den",
+                                                         "version": "2.0.0", "proto": 2, "codec": "pcm"}).encode()))
+            done.wait(5)
+            conn.close()
+        threading.Thread(target=silent_host, daemon=True).start()
+        client = sa.Client("127.0.0.1", lambda *a, **kw: None, port=srv.getsockname()[1], log=quiet)
+        client.start()
+        try:
+            self.assertTrue(wait_until(lambda: client.phase == "connected", 5), client.problem)
+            client.stop()
+            time.sleep(0.5)
+            self.assertIsNone(client.problem)
+        finally:
+            client.stop()
+            done.set()
+            srv.close()
+
     def test_a_listener_stopped_while_the_host_answers_opens_nothing(self):
         srv = socket.socket()
         srv.bind(("127.0.0.1", 0))

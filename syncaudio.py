@@ -1345,7 +1345,9 @@ class Client:
             except OldHost:
                 wait = self.OLD_HOST_RETRY      # (each try shows up on that Mac as a join)
             except (OSError, ValueError, KeyError, ConnectionError) as e:
-                if self.running and self.phase == "connected":
+                if not self.running:
+                    pass            # stop() cut the connection: nothing went wrong
+                elif self.phase == "connected":
                     self.log(f"lost the host ({e}); reconnecting...")
                 elif isinstance(e, OSError) and not (self.problem and self.problem.get("code") == "isolated"):
                     self.problem = explain(e)
