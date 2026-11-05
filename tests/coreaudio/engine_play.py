@@ -60,6 +60,7 @@ class Feeder(threading.Thread):
         super().__init__(daemon=True)
         self.feed, self.T0 = feed, T0
         self.done = threading.Event()
+        self.until = None           # when the last sample fed is due: the content ends there
 
     def run(self):
         n = 0
@@ -69,6 +70,7 @@ class Feeder(threading.Thread):
                 time.sleep(wait)
             self.feed(n, self.T0 + n / RATE + D, content(n, BLOCK))
             n += BLOCK
+            self.until = self.T0 + n / RATE + D
 
 
 class Engine(ae.OutputEngine):
@@ -138,11 +140,18 @@ def play_v2(args, index, out_info):
         timeline.append({"t": round(time.monotonic() - started, 3), **out.second()})
     finally:
         feeder.done.set()
+        feeder.join(1.0)
         clock = out.engine.clock.stats()
+        closing = time.monotonic()
         out.close()
         player.sb.close()
     f = out.facts or {}
-    return {"T0": started, "started": started, "strlat": f["stream_latency"] / f["nominal_rate"]
+    # The sound is the content until whichever comes first: the content's end (D after the feeder stopped)
+    # or the stream's close. "stopped" comes later still, after the stress threads are joined - over a
+    # second under ci stress: judged up to there, the content's own end was taken for a hole (P3).
+    audio_end = min(closing, feeder.until) if feeder.until is not None else closing
+    return {"T0": started, "started": started, "audio_end": audio_end,
+            "strlat": f["stream_latency"] / f["nominal_rate"]
             if f.get("nominal_rate") else 0.0, "io": [clock["frames_min"], clock["frames_max"]],
             "clock": clock, "timeline": timeline, "actions": actions, "noted": Engine.noted,
             "fake": getattr(out.stream, "stats", None)}

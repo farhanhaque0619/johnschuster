@@ -239,6 +239,29 @@ class ScriptsOnFakeDevicesTest(unittest.TestCase):
         return {**os.environ, "PYTHONPATH": os.path.join(ca, "fakemac") + os.pathsep + root,
                 "SYNCAUDIO_FAKE_MAC": state, "SYNCAUDIO_FAKE_TWINS": "1" if twins else "0"}
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "on a Mac the realtime-audio job runs the real thing")
+    def test_engine_play_says_when_its_sound_ended_not_only_when_it_exited(self):
+        """The sound ends D after the feeder stops (or when the stream closes); the process exits later,
+        after joining the stress threads. P3 judged up to exiting and took the content's own end for a
+        hole (CI run 29)."""
+        state = tempfile.mkdtemp()
+        env = {**self.env(state, False), "SACORE_LIB": os.environ.get("SACORE_LIB") or
+               os.path.join(root, "libsacore.so")}
+        prefix = os.path.join(state, "play")
+        run = subprocess.run([sys.executable, os.path.join(ca, "engine_play.py"), "--device", "BlackHole 2ch",
+                              "--seconds", "2", "--out", prefix], capture_output=True, text=True, timeout=120,
+                             env=env, cwd=root)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        with open(prefix + ".json") as f:
+            st = json.load(f)
+        sys.path.insert(0, ca)
+        import run_all
+        self.assertLessEqual(st["audio_end"], st["stopped"])
+        self.assertGreaterEqual(st["audio_end"], st["started"] + 2.0)
+        self.assertLessEqual(st["audio_end"], st["started"] + 2.0 + 1.0 + st["D"])     # (1 s ticks)
+        self.assertEqual(run_all.ended(st), st["audio_end"])
+        self.assertEqual(run_all.ended({"stopped": 5.0}), 5.0)                      # (the legacy engine)
+
     def test_wait_devices_asserts_the_fixture_and_says_whether_the_twins_are_there(self):
         for twins in (True, False):
             state = tempfile.mkdtemp()

@@ -282,9 +282,15 @@ def must(j: dict) -> dict:
     return j
 
 
+def ended(st: dict) -> float:
+    """When engine_play's sound ended: the content's end or the stream's close, not "stopped" (which is
+    after the stress threads were joined: up to seconds later, all of it silence)."""
+    return min(st["stopped"], st.get("audio_end") or math.inf)
+
+
 def judged(rec, st, warm: float, tail: float = 0.5) -> dict:
-    """engine_play's content as recorded, from `warm` s after it started to `tail` s before it stopped."""
-    return must(judge.ramp(rec, st["T0"], st["D"], strlat(st), st["started"] + warm, st["stopped"] - tail))
+    """engine_play's content as recorded, from `warm` s after it started to `tail` s before it ended."""
+    return must(judge.ramp(rec, st["T0"], st["D"], strlat(st), st["started"] + warm, ended(st) - tail))
 
 
 # ------------------------------------------------------------------------------------- phases
@@ -292,7 +298,7 @@ def preflight(ctx, d, c):
     with Recorder(ctx, d, BH, "bh") as r:
         st = ctx.play(d, "v2", BH, max(3.0, ctx.s(3.0)))
     rec = r.stop()
-    rms = rec.rms(st["started"] + 1.0, st["stopped"] - 0.2)
+    rms = rec.rms(st["started"] + 1.0, ended(st) - 0.2)
     played = st["io"][1] is not None
     c("2.0 played into BlackHole 2ch (callbacks came)", played, st["io"])
     if played and rms == 0.0:
@@ -365,7 +371,7 @@ def control(ctx, device: str) -> dict:
         j = judged(r.stop(), st, warm)
         tl = st["timeline"]
         ctx.controls[device] = {
-            "window_s": st["stopped"] - st["started"] - warm, "skips": grew(tl, "skips", warm),
+            "window_s": ended(st) - st["started"] - warm, "skips": grew(tl, "skips", warm),
             "overloads": grew(tl, "overloads", warm), "events": j["holes"] + j["discontinuities"],
             "excused": excused(st, r.rec), "judge": j, "cpu_pct": st["cpu_pct"]}
         ctx.keep(d, ok=True)
@@ -384,7 +390,7 @@ def p3(ctx, d, c, stress="ci", seconds=70.0):
             st = ctx.play(d, tag, device, ctx.s(seconds), "v2", stress)
         warm = ctx.s(10.0)
         j = judged(r.stop(), st, warm)
-        tl, window = st["timeline"], st["stopped"] - st["started"] - warm
+        tl, window = st["timeline"], ended(st) - st["started"] - warm
         ex_skips, ex_events = excused(st, r.rec)
         skips, overloads = grew(tl, "skips", warm), grew(tl, "overloads", warm)
         cb_max = max((e["cb_max_us"] for e in tl if e["t"] > warm), default=None)
@@ -427,7 +433,7 @@ def p4(ctx, d, c):
     rec = r.stop()
     warm = ctx.s(5.0)
     j = judged(rec, st, warm)
-    tl, window = st["timeline"], st["stopped"] - st["started"] - warm
+    tl, window = st["timeline"], ended(st) - st["started"] - warm
     ex_skips, ex_events = excused(st, rec)
     stall = st.get("stall", {}).get("t")
     stalled = next((n for n in st["noted"] if n["cb_ms"] >= 50 and stall and n["entry"] >= stall - 0.01), None)
@@ -437,7 +443,7 @@ def p4(ctx, d, c):
     holes = [e for e in j["events"] if stalled and abs(e["t"] - (stalled["dac"] - strlat(st))) <= buffer]
     others = [e for e in j["events"] if e not in holes]
     before = must(judge.ramp(rec, st["T0"], st["D"], strlat(st), st["started"] + warm, stall - 1.0)) if stall else {}
-    after = must(judge.ramp(rec, st["T0"], st["D"], strlat(st), stall + 1.0, st["stopped"] - 0.5)) if stall else {}
+    after = must(judge.ramp(rec, st["T0"], st["D"], strlat(st), stall + 1.0, ended(st) - 0.5)) if stall else {}
     flags = 0
     for e in tl:
         flags |= e.get("pa_flags") or 0
@@ -645,7 +651,7 @@ def p7(ctx, d, c):
     c("the rate was changed and changed back", len(changes) == 2 and all(x["ok"] for x in changes), changes)
     if len(changes) == 2:
         back = changes[1]["t"]
-        j = must(judge.ramp(rec, st["T0"], st["D"], strlat(st), back + 2.0, st["stopped"] - 0.5))
+        j = must(judge.ramp(rec, st["T0"], st["D"], strlat(st), back + 2.0, ended(st) - 0.5))
         c.numbers["after"] = j
         ex = excused(st, rec)[1]
         c("audio back within 2 s of the rate coming back", j["holes"] + j["discontinuities"] <= ex, [j["events"], ex])
