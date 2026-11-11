@@ -14,7 +14,9 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14       # Apple Silicon (M1 and newer)
+    # Apple Silicon (M1 and newer). GitHub retired macos-14 on 2026-11-02 (its jobs are cancelled before
+    # they start); the app still targets macOS 14 (LSMinimumSystemVersion, libsacore's -mmacosx-version-min).
+    runs-on: macos-15
     timeout-minutes: 45     # (the tests alone take 10-15 minutes since 2.0)
     steps:
       - uses: actions/checkout@v4
@@ -183,7 +185,7 @@ jobs:
     # 2.0's engine on real CoreAudio, judged at the "speaker": BlackHole loops what is played back
     # as input, and a separate, unstressed recorder process captures it (tests/coreaudio/run_all.py).
     # The frozen 1.1.6 engine must FAIL here (the canary), or these tests can't see the bug.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
