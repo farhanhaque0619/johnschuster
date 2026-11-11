@@ -142,7 +142,12 @@ jobs:
             python -c "import json,sys; s=json.loads(sys.argv[1]); assert (s['needs_fix'], s['app']) == ($1, '$2'), s" "$out"
           }
           sudo $FW --setglobalstate on
-          check True not_listed
+          # An app not on the firewall's list: macOS 14 said "not part of the firewall" (the app asks to be
+          # allowed), macOS 15 says "Incoming connection ... is permitted". Read as macOS says it.
+          out=$(dist/SyncAudio.app/Contents/MacOS/SyncAudio --firewall-status); echo "$out"
+          python -c "import json,sys; s=json.loads(sys.argv[1]); a=s['raw']['app'].lower()
+          want = (False, 'allowed') if 'permitted' in a else (True, 'not_listed')
+          assert (s['needs_fix'], s['app']) == want, s" "$out"
           sudo $FW --add "$APPX" && sudo $FW --blockapp "$APPX"
           check True blocked
           sudo $FW --unblockapp "$APPX"
