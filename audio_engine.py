@@ -418,6 +418,7 @@ class OutputEngine:
     LOOK = 17 + XFADE
     ROOM = 4096             # never write within this of a full ring
     STALL_FLOOR = 0.050
+    EARLY = 0.5             # a buffer asked for before this much of the one before it has played: a burst
 
     def __init__(self, ring, sb: StreamBuffer, to_server=lambda t: t, server_rate=lambda: 1.0,
                  offset_s=lambda: 0.0, volume=lambda: 1.0, channel=lambda: "both", clock_offset: float = 0.0,
@@ -447,6 +448,11 @@ class OutputEngine:
         self.sync_since = None          # since when the timing has held in sync (see _track_sync)
         self._jumps = 0
         self.max_frames = 0
+        # The most the device has taken in one go: one buffer, or (an AirPlay TV) several back to back.
+        self.burst_frames = 0
+        self._burst = 0
+        self._prev_cb = None            # (PortAudio time, frames) of the callback before
+        self._dry_floor = 0.0           # `ahead` never goes under this again: it ran dry there, Python on time
         self.vol = None                 # gain at the next frame written
         self._vol_to = 1.0
         self.mode = None                # channel matrix in use, and the one it is fading from
@@ -542,6 +548,15 @@ class OutputEngine:
     def _callbacks(self, recs):
         self.clock.feed(recs)
         self.max_frames = max(self.max_frames, int(recs["frames"].max()))
+        for t, n in zip(recs["current_time"].tolist(), recs["frames"].tolist()):
+            prev = self._prev_cb
+            if t <= 0:
+                self._prev_cb = None
+                continue
+            early = prev is not None and t - prev[0] < self.EARLY * prev[1] / self.rate
+            self._burst = self._burst + n if early else n
+            self.burst_frames = max(self.burst_frames, self._burst)
+            self._prev_cb = (t, n)
         cur = recs["current_time"]
         gaps = np.diff(cur, prepend=cur[0] if self.last_cb is None else self.last_cb)
         if gaps.max() >= 0.3:                   # macOS stopped calling for a while
@@ -579,7 +594,10 @@ class OutputEngine:
                 self.reseeks += 1                                   # came too late)
                 if self._fill_t is not None and self._lead_left is not None and \
                         self.now() - self._fill_t < self._lead_left - guard / self.rate - 0.010:
-                    self.unexplained += 1           # it was back in time, and the ring ran dry anyway
+                    self.unexplained += 1           # it was back in time, and the ring ran dry anyway:
+                    # the device takes more at once than it showed. Keep more for good, not just until
+                    # a quiet minute shrinks it back to where it ran dry.
+                    self._dry_floor = min(self.AHEAD_MAX, max(self._dry_floor, 1.5 * self._lead_left))
                 # Some audio was left, but less than the device may take next: the new run starts past
                 # it, and the silence between is audio missing like any underrun - which the C side
                 # counts only when the ring runs out (edge < r), not for a gap between runs.
@@ -851,10 +869,12 @@ class OutputEngine:
             self._sec0, self._sec_cb_ns = dict(self.counts), 0
             self._h_min, self._w_max = math.inf, 0.0
         w30 = max([self._w_max, *self._w30])
-        # Just after the device takes a buffer, a buffer and the guard must still be left (else every
-        # callback is a re-seek: 4096-frame buffers would lose half their audio at 0.15 s), through
-        # the worst stall in 30 s.
-        target = max(self.AHEAD_MIN, 1.5 * w30 + (2 * self.max_frames + 64) / self.rate)
+        # Just after the device takes a buffer - or a burst of them - a buffer and the guard must still
+        # be left (else every callback is a re-seek: 4096-frame buffers would lose half their audio at
+        # 0.15 s; an AirPlay TV's double 2435-frame request ran it dry every ~90 s), through the worst
+        # stall in 30 s.
+        took = max(self.burst_frames, self.max_frames)
+        target = max(self.AHEAD_MIN, self._dry_floor, 1.5 * w30 + (took + self.max_frames + 64) / self.rate)
         self.ahead = min(self.AHEAD_MAX, max(self.ahead, target))
         if now - self._quiet_since >= 60 and now - self._last_shrink >= 10:
             self.ahead = max(target, 0.9 * self.ahead)
@@ -886,7 +906,8 @@ class OutputEngine:
                "pa_flags": rep["flags"], "underruns": cs["underrun_events"], "unexplained": self.unexplained,
                "underrun_ms": round(cs["underrun_frames"] / self.rate * 1000, 1),
                "ring_lead_min_ms": None if rep["lead_min"] == sacore.NO_LEAD else ms(rep["lead_min"] / self.rate),
-               "ahead_ms": ms(self.ahead), "headroom_min_ms": ms(self.headroom_min),
+               "ahead_ms": ms(self.ahead), "burst_ms": ms(self.burst_frames / self.rate),
+               "headroom_min_ms": ms(self.headroom_min),
                "spare_1s_ms": ms(self.spare_1s), "spare_30_ms": ms(self.spare_30),
                "deficit_ms": ms(max(self._deficit5, default=0.0)),
                "err_ms": round(rep["err_sum"] / rep["err_n"] * 1000, 3) if rep["err_n"] else None,

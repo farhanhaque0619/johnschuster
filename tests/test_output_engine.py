@@ -38,7 +38,8 @@ class Mac:
     `stalls` hold its Python up."""
 
     def __init__(self, sim, seconds, frames=1024, lead=0.2, ppm=0.0, off=0.0, drift_ppm=0.0, ring_s=4.0,
-                 channels=2, stalls=(), report=lambda k: 0.0, invalid=lambda k: False, **engine):
+                 channels=2, stalls=(), report=lambda k: 0.0, invalid=lambda k: False, early=lambda k: 0.0,
+                 **engine):
         ta, k = sim.t, drift_ppm * 1e-6
         self.S = lambda t: t + off + k * (t - ta)               # this Mac's clock -> the host's
         self.local = lambda t: ta + (t - off - ta) / (1 + k)
@@ -47,7 +48,7 @@ class Mac:
         self.engine = ae.OutputEngine(self.ring, self.sb, to_server=self.S, server_rate=lambda: 1 + k,
                                       now=lambda: self.local(sim.t), **engine)
         self.dev = vd.Device(sim, self.ring, frames, lead, ppm, seconds, local=self.local, report=report,
-                             invalid=invalid)
+                             invalid=invalid, early=early)
         sim.every(ae.OutputEngine.TICK, self.engine.tick, skip=lambda t: any(a <= t < a + d for a, d in stalls))
 
     def judge(self, due, t_from, t_to=math.inf, allow=()):
@@ -235,6 +236,39 @@ class StallTest(unittest.TestCase):
         self.assertLessEqual(r["err_max_ms"], 0.05, r)
         self.assertEqual(r["glitches"], 0, r)
         self.assertEqual(e.unexplained, 0)                      # Python held it up longer than it had
+
+    def test_an_output_that_takes_buffers_in_bursts_keeps_enough_for_a_burst(self):
+        """Saifan sharing to an AirPlay TV (2435-frame buffers, now and then two back to back): once a
+        quiet minute had shrunk `ahead` back to its 0.15 s floor, a burst left less than the guard and
+        the ring ran dry - with Python on time - every ~90 s, for as long as it played."""
+        period = 2435 / RATE
+        sim = vd.Sim()
+        self.mac = m = Mac(sim, 300, frames=2435, lead=0.09, early=lambda k: period - 0.001 if k % 7 == 0 else 0.0)
+        T0 = sim.t
+        vd.Feeder(sim, m.sb, T0, delay=lambda n: 0.9, net=0.005)
+        sim.run(300)
+        e = m.engine
+        st = e.second()
+        # (every time the ring ran dry is counted; before, at 125 s and 216 s - Saifan's 91 s apart)
+        self.assertEqual((st["underruns"], e.reseeks, e.unexplained), (0, 0, 0), st)
+        self.assertEqual(e.burst_frames, 2 * 2435)
+        self.assertGreaterEqual(e.ahead, (3 * 2435 + 64) / RATE)        # a burst, a buffer and the guard
+        r = m.judge(vd.steady(T0, 0.9), T0 + 115, T0 + 135)
+        self.assertEqual(r["glitches"], 0, r)
+
+    def test_a_ring_that_ran_dry_with_python_on_time_is_never_shrunk_back_to_there(self):
+        """The same TV, if its bursts can't be seen in the callbacks' times: it runs dry once, and from
+        then on keeps 1.5 x what it had - not shrunk back to it by the next quiet minute."""
+        period = 2435 / RATE
+        sim = vd.Sim()
+        self.mac = m = Mac(sim, 300, frames=2435, lead=0.09, early=lambda k: period - 0.001 if k % 7 == 0 else 0.0)
+        m.engine.EARLY = 0.0                                            # (no burst is seen)
+        T0 = sim.t
+        vd.Feeder(sim, m.sb, T0, delay=lambda n: 0.9, net=0.005)
+        sim.run(300)
+        e = m.engine
+        self.assertEqual((e.reseeks, e.unexplained), (1, 1))
+        self.assertGreaterEqual(e.ahead, 1.5 * ae.OutputEngine.AHEAD_MIN - 0.01)
 
     def test_python_held_up_right_after_reading_the_ring_is_no_bug(self):
         """The GIL can go to another thread just after the C read (inside ring.state()) and before the

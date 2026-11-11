@@ -472,7 +472,9 @@ class DelayPolicy:
     due - through Wi-Fi stalls and busy moments - and no longer. Asked once a second on the host with
     every player's report (its own and each listener's STATS); answers at most one Request for the
     DelaySchedule:
-      urgent  a player ran dry or lost audio: up at once (a short faded pause), by what it lacked
+      urgent  a player lost audio, or ran dry for want of delay: up at once (a short faded pause), by
+              what it lacked. Not for a dry ring with room to spare: that player's engine keeps more in
+              its ring, and a longer delay would change nothing
       join    a newcomer, or a Mac that moved to an output that needs more (AirPods: ~0.2 s to the
               ear): up at once, one short faded step, so it never plays for long without that room
       raise   over the last 30 s someone came within MARGIN of running dry (a close call is no reason
@@ -525,6 +527,7 @@ class DelayPolicy:
     class _Seen:
         def __init__(self):
             self.lead = self.spare = self.under = self.holes = self.rose_at = self.reported = None
+            self.lost = False               # what rose was audio that never came (holes), not only a dry ring
             self.deficit = 0.0
             self.joined = None              # the lead its join was judged on
             self.need: deque = deque()      # (t, delay - spare_1s)
@@ -545,7 +548,7 @@ class DelayPolicy:
             p.reported = s["reported_s"]
             under, holes = s.get("underruns") or 0, s.get("holes") or 0
             if p.under is not None and (under > p.under or holes > p.holes) and not excused:
-                p.rose_at = now
+                p.rose_at, p.lost = now, p.lost or holes > p.holes
             p.under, p.holes = under, holes
             p.spare = None if s.get("spare_1s_ms") is None else s["spare_1s_ms"] / 1000
             p.deficit = 0.0 if excused else (s.get("deficit_ms") or 0) / 1000
@@ -555,15 +558,25 @@ class DelayPolicy:
                 p.need.popleft()
         seen = self.players.values()
 
-        if now - self.urgent_at >= self.URGENT_MIN_GAP and any(
-                p.rose_at is not None and p.rose_at > self.urgent_at for p in seen):
+        risen = [p for p in seen if p.rose_at is not None and p.rose_at > self.urgent_at]
+        if now - self.urgent_at >= self.URGENT_MIN_GAP and risen:
             deficit = max(p.deficit for p in seen)            # audio that came too late: that much, and margin
             lacking = max(self.MARGIN - min((p.spare for p in seen if p.spare is not None), default=self.MARGIN),
                           deficit + self.MARGIN if deficit > 0 else 0.0)
-            delta = min(self.D_MAX - d, max(self.URGENT_DELTA[0], min(self.URGENT_DELTA[1], lacking)))
-            if delta > 0.001:
-                self.urgent_at = self.raised_at = now
-                return Request("urgent", delta, "ran out of audio")
+            if lacking <= 0 and not any(p.lost for p in risen):
+                # It ran dry with room to spare and nothing came late: its own ring was too short (a Python
+                # stall, or an output that takes audio in bursts - an AirPlay TV, every 90 s). Its engine
+                # keeps more from now on; a longer delay would change nothing, and every step is a pause
+                # on every Mac.
+                for p in risen:
+                    p.rose_at = None
+            else:
+                delta = min(self.D_MAX - d, max(self.URGENT_DELTA[0], min(self.URGENT_DELTA[1], lacking)))
+                for p in risen:
+                    p.lost = False
+                if delta > 0.001:
+                    self.urgent_at = self.raised_at = now
+                    return Request("urgent", delta, "ran out of audio")
         if sch.busy:
             return None
         for key, p in self.players.items():

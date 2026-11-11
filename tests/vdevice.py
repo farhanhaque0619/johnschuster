@@ -96,11 +96,14 @@ class Device:
 
     IO cycle at device frame f happens at io0 + f / true_rate (true time). Output: its frames reach the
     ear `lead` later; input: they were sampled `lead` earlier. Its timestamps are in the Mac's own
-    clock, `local(true time)`, plus report(k) (wobble), or 0 when invalid(k)."""
+    clock, `local(true time)`, plus report(k) (wobble), or 0 when invalid(k). early(k): callback k
+    comes that much before its cycle (an AirPlay TV asks for buffers in bursts); its frames still play
+    at their cycle's time."""
 
     def __init__(self, sim: Sim, ring, frames=1024, lead=0.2, ppm=0.0, seconds=30.0, local=lambda t: t,
-                 report=lambda k: 0.0, invalid=lambda k: False):
+                 report=lambda k: 0.0, invalid=lambda k: False, early=lambda k: 0.0):
         self.sim, self.ring, self.local, self.report, self.invalid = sim, ring, local, report, invalid
+        self.early = early
         self.out = ring.kind == "output"
         self.frames = itertools.cycle(frames) if isinstance(frames, (list, tuple)) else itertools.repeat(frames)
         self.true_rate = RATE * (1 + ppm * 1e-6)
@@ -138,7 +141,7 @@ class Device:
         t_io = self.io0 + self.f / self.true_rate
         stamp = t_io + self.lead if self.out else t_io - self.lead
         stamp = 0.0 if self.invalid(self.k) else self.local(stamp) + self.report(self.k)
-        ti = TimeInfo(0.0 if self.out else stamp, self.local(t_io), stamp if self.out else 0.0)
+        ti = TimeInfo(0.0 if self.out else stamp, self.local(self.sim.t), stamp if self.out else 0.0)
         if self.out:
             slot = self.f + round((self.lead - self.lead0) * self.true_rate)
             if 0 <= slot and slot + n <= len(self.tape):
@@ -151,7 +154,7 @@ class Device:
             self.cb(pcm.ctypes.data, None, n, ctypes.byref(ti), 0, self.ring.h)
         self.f += n
         self.k += 1
-        self.sim.at(self.io0 + self.f / self.true_rate, self._cycle)
+        self.sim.at(self.io0 + self.f / self.true_rate - self.early(self.k), self._cycle)
 
     def drop(self, frames: int):
         """The HAL skips the next `frames` of IO (whole cycles: an overload; less: a loss under the C

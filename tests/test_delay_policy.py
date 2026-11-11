@@ -97,15 +97,39 @@ class PolicyTest(unittest.TestCase):
         speakers = self.run_for(1, lambda: {"here": here.report(self.schedule.d), 8: {"lead_ms": 35.0}})
         self.assertEqual(speakers, [])                                          # speakers need nothing
 
-    def test_running_dry_is_urgent_once_per_5_s(self):
+    def test_running_dry_for_want_of_delay_is_urgent_once_per_5_s(self):
         p = Player()
+        p.deficit = 0.01                                                        # its audio keeps coming late
         reqs = []
         for i in range(12):
             p.underruns += 1                                                    # every second
             reqs += self.run_for(1, self.reports(a=p))
         # (the first report is what later ones are compared with)
         self.assertEqual([(t, r.mode) for t, r in reqs], [(2.0, "urgent"), (7.0, "urgent"), (12.0, "urgent")])
-        self.assertTrue(all(round(r.delta, 3) == 0.02 for _, r in reqs))       # the least: it had spare
+        self.assertTrue(all(round(r.delta, 3) == 0.07 for _, r in reqs))       # what was late, and MARGIN
+
+    def test_a_raise_that_gave_it_room_is_enough(self):
+        p = Player(need=0.42)                                                   # 30 ms spare: under MARGIN
+        reqs = []
+        for i in range(12):
+            p.underruns += 1
+            reqs += self.run_for(1, self.reports(a=p))
+        self.assertEqual([(t, r.mode, round(r.delta, 3)) for t, r in reqs], [(2.0, "urgent", 0.03)])
+
+    def test_running_dry_with_room_to_spare_is_no_step_for_everyone(self):
+        """Saifan sharing to an AirPlay TV: its ring ran dry every ~90 s with 700 ms to spare, and each
+        time every Mac got a +20 ms pause - the delay crept from 0.84 s to 0.96 s in 10 minutes, and
+        no longer delay could have helped. That player's engine keeps more in its ring instead."""
+        p = Player(need=0.25)                                                   # 200 ms spare
+        self.run_for(1, self.reports(a=p))
+        reqs = []
+        for _ in range(10):
+            p.underruns += 1
+            reqs += self.run_for(91, self.reports(a=p))
+        self.assertEqual(reqs, [])
+        self.assertEqual(self.schedule.d, 0.45)
+        p.need, p.deficit, p.underruns = 0.55, 0.1, p.underruns + 1            # audio late: that's the delay's
+        self.assertEqual([r.mode for _, r in self.run_for(1, self.reports(a=p))], ["urgent"])
 
     def test_a_close_call_is_raised_quietly_not_urgently(self):
         # 10 ms spare, nothing lost: an audible step on every Mac would be worse than the risk
@@ -136,7 +160,7 @@ class PolicyTest(unittest.TestCase):
         p.holes, p.deficit, p.need = 2 * 38400, 0.0, 0.25                       # (holes counted a report later)
         reqs += self.run_for(20, self.reports(a=p))
         self.assertEqual(reqs, [])
-        p.underruns += 1                                                        # a real one, later
+        p.holes += 480                                                          # a real one, later
         self.assertEqual([r.mode for _, r in self.run_for(1, self.reports(a=p))], ["urgent"])
 
     def test_a_player_who_puts_airpods_in_later_gets_their_room_too(self):
@@ -173,7 +197,7 @@ class PolicyTest(unittest.TestCase):
         self.schedule.d, self.t = 0.9, 5000.0
         p = Player(need=0.5)
         self.run_for(1, self.reports(a=p))
-        p.underruns = 1                                                         # ran dry: an urgent raise
+        p.holes = 480                                                           # audio lost: an urgent raise
         self.assertEqual(self.run_for(1, self.reports(a=p))[0][1].mode, "urgent")
         reqs = self.run_for(599, self.reports(a=p))
         self.assertEqual(reqs, [])                                              # no lowering within 10 min
