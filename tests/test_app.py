@@ -500,6 +500,16 @@ class FirewallTest(unittest.TestCase):
         self.assertTrue(app.parse_firewall(on, "Firewall is set to block all non-essential incoming connections",
                                            "Incoming connection to the application is permitted")["needs_fix"])
 
+    def test_block_all_as_macos_15_says_it(self):
+        # (CI's macos-15 runner, socketfilterfw --getglobalstate / --getblockall / --getappblocked)
+        s = app.parse_firewall("Firewall is blocking all non-essential incoming connections. (State = 2)",
+                               "Firewall is blocking all non-essential incoming connections.",
+                               "Incoming connection to /Applications/SyncAudio.app is permitted.")
+        self.assertEqual((s["enabled"], s["block_all"], s["app"], s["needs_fix"]), (True, True, "allowed", True))
+        off = app.parse_firewall("Firewall is enabled. (State = 1)", "Firewall has block all state set to disabled.",
+                                 "Incoming connection to /Applications/SyncAudio.app is permitted.")
+        self.assertEqual((off["block_all"], off["needs_fix"]), (False, False))
+
     def test_asked_when_sharing_starts_then_kept_five_minutes(self):
         c = app.Controller(sd=FakeSoundDevice(), prefs_file=Path(tempfile.mkdtemp()) / "p.json", port=free_port(),
                            scan=False)

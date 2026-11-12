@@ -60,7 +60,10 @@ def parse_firewall(globalstate: str, blockall: str, app: str) -> dict:
     """Read socketfilterfw's answers: is the macOS firewall keeping other Macs out?"""
     g, b, a = globalstate.lower(), blockall.lower(), app.lower()
     enabled = ("enabled" in g or re.search(r"state = [12]", g) is not None) and "disabled" not in g
-    block_all = bool(b.strip()) and "disabled" not in b and ("block all" in b or "enabled" in b)
+    # "Block all incoming connections": macOS 14 "... set to block all ...", macOS 15 "Firewall is blocking all
+    # non-essential incoming connections." (and its global state reads "(State = 2)")
+    block_all = (bool(b.strip()) and "disabled" not in b and any(w in b for w in ("block all", "blocking all", "enabled"))
+                 or re.search(r"state = 2", g) is not None)
     if "not part of the firewall" in a or not a.strip():
         app_state = "not_listed"
     elif "block" in a:
