@@ -270,6 +270,18 @@ class StallTest(unittest.TestCase):
         self.assertEqual((e.reseeks, e.unexplained), (1, 1))
         self.assertGreaterEqual(e.ahead, 1.5 * ae.OutputEngine.AHEAD_MIN - 0.01)
 
+    def test_a_plain_stall_on_a_2048_frame_device_is_no_bug(self):
+        """A callback takes its whole buffer the moment it runs - right after the ring was read, the ring
+        is a buffer shorter than time alone says. A stall that ends just as the ring reaches its guard is
+        an ordinary Python stall, not "back in time and dry anyway" (CI's P3 on the AirPods-like twin,
+        about once in 13 dry rings; this stall was one of 7 such in a sweep)."""
+        sim = vd.Sim()
+        self.mac = m = Mac(sim, 7, frames=2048, lead=0.2, stalls=[(1000.0 + 4.0, 0.1494)])
+        vd.Feeder(sim, m.sb, sim.t, delay=lambda n: 0.4348, net=0.005)
+        sim.run(7)
+        e = m.engine
+        self.assertEqual((e.reseeks, e.unexplained), (1, 0))
+
     def test_python_held_up_right_after_reading_the_ring_is_no_bug(self):
         """The GIL can go to another thread just after the C read (inside ring.state()) and before the
         clock is read: that tick's clock is late by the stall. The dry ring after it is still the

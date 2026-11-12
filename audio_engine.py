@@ -592,8 +592,13 @@ class OutputEngine:
         if w < r + guard:                       # first time, or the ring ran dry (Python stalled for
             if self.cursor is not None and not self.silent:        # longer than ahead, or the audio
                 self.reseeks += 1                                   # came too late)
+                # The device takes a whole buffer (or a burst it has shown) at the instant of a callback,
+                # and one may come right after r was read: the ring can be at its guard that much sooner
+                # than time alone says. (10 ms alone took a 2048-frame device's quantum for a bug: P3,
+                # about once in 13 dry rings under CI's GIL stress.)
+                took = max(self.burst_frames, self.max_frames)
                 if self._fill_t is not None and self._lead_left is not None and \
-                        self.now() - self._fill_t < self._lead_left - guard / self.rate - 0.010:
+                        self.now() - self._fill_t < self._lead_left - (guard + took) / self.rate - 0.010:
                     self.unexplained += 1           # it was back in time, and the ring ran dry anyway:
                     # the device takes more at once than it showed. Keep more for good, not just until
                     # a quiet minute shrinks it back to where it ran dry.
